@@ -2,6 +2,13 @@
 name = "codex-session-selector"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "TUI utilities for indexing, selecting, and replaying local Codex session JSONL files."
+repository = "https://github.com/widehyo1/codex-session-selector"
+readme = "README.md"
+license = "MIT"
+keywords = ["codex", "tui", "session", "cli"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1"

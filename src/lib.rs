@@ -20,19 +20,10 @@ pub struct SessionRow {
     pub is_subsession: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct CollectOptions {
     pub include_subsessions: bool,
     pub include_empty_messages: bool,
-}
-
-impl Default for CollectOptions {
-    fn default() -> Self {
-        Self {
-            include_subsessions: false,
-            include_empty_messages: false,
-        }
-    }
 }
 
 pub fn is_subsession_meta(payload: &Value) -> bool {

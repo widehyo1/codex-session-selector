@@ -12,7 +12,13 @@ Repository: <https://github.com/widehyo1/codex-session-selector.git>
 
 ## Install
 
-Install all three binaries from this repository:
+Install all three binaries from crates.io:
+
+```bash
+cargo install codex-session-selector
+```
+
+Or install from this repository:
 
 ```bash
 ./install-bundle.sh
@@ -24,7 +30,7 @@ By default, the script installs to `~/.local/bin`. Override the destination with
 CODEX_CLI_BIN_DIR=~/.cli/bin ./install-bundle.sh
 ```
 
-Until crates.io publishing is set up, install directly from Git with:
+Install directly from Git with:
 
 ```bash
 cargo install --git https://github.com/widehyo1/codex-session-selector.git --bins
