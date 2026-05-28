@@ -1,8 +1,12 @@
-use std::{env, path::PathBuf, process::Command, time::Duration};
+use std::{env, io, path::PathBuf, process::Command, time::Duration};
 
 use anyhow::{Result, bail};
 use codex_session_selector::{SessionRow, load_sessions, session_date};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -22,21 +26,41 @@ fn main() -> Result<()> {
         bail!("no sessions found in {}", args.db.display());
     }
 
-    let mut terminal = ratatui::init();
-    let selected = run_app(&mut terminal, App::new(rows));
-    ratatui::restore();
-
-    let Some(path) = selected? else {
-        std::process::exit(130);
-    };
+    let mut app = App::new(rows);
 
     if args.print_path {
+        let mut terminal = ratatui::init();
+        let action = run_app(&mut terminal, &mut app);
+        restore_terminal();
+
+        let AppAction::Replay(path) = action? else {
+            return Ok(());
+        };
         println!("{}", path.display());
         return Ok(());
     }
 
-    let status = Command::new(&args.replay_command).arg(path).status()?;
-    std::process::exit(status.code().unwrap_or(1));
+    loop {
+        let mut terminal = ratatui::init();
+        let action = run_app(&mut terminal, &mut app);
+        restore_terminal();
+
+        match action? {
+            AppAction::Quit => return Ok(()),
+            AppAction::Replay(path) => {
+                let status = Command::new(&args.replay_command).arg(path).status()?;
+                app.status = if status.success() {
+                    None
+                } else {
+                    Some(format!(
+                        "{} exited with status {}",
+                        args.replay_command,
+                        status.code().unwrap_or(1)
+                    ))
+                };
+            }
+        }
+    }
 }
 
 struct Args {
@@ -111,6 +135,11 @@ fn record_command_args(db: &std::path::Path) -> Vec<String> {
     vec!["--output".to_string(), db.to_string_lossy().to_string()]
 }
 
+fn restore_terminal() {
+    ratatui::restore();
+    let _ = execute!(io::stdout(), cursor::Show);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Normal,
@@ -133,6 +162,12 @@ enum SearchScope {
     Date,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AppAction {
+    Quit,
+    Replay(PathBuf),
+}
+
 struct App {
     rows: Vec<SessionRow>,
     filtered: Vec<SessionRow>,
@@ -144,6 +179,7 @@ struct App {
     metadata_scroll: usize,
     message_scroll: u16,
     show_help: bool,
+    status: Option<String>,
 }
 
 impl App {
@@ -163,6 +199,7 @@ impl App {
             metadata_scroll: 0,
             message_scroll: 0,
             show_help: false,
+            status: None,
         }
     }
 
@@ -177,6 +214,10 @@ impl App {
 
     fn selected_path(&self) -> Option<PathBuf> {
         self.selected_row().map(|row| row.path.clone())
+    }
+
+    fn selected_resume_command(&self) -> Option<String> {
+        self.selected_row().and_then(resume_command)
     }
 
     fn refresh_filter(&mut self) {
@@ -227,6 +268,24 @@ impl App {
 
     fn message_page_up(&mut self) {
         self.message_scroll = self.message_scroll.saturating_sub(10);
+    }
+
+    fn copy_resume_command_to_clipboard(&mut self) {
+        let Some(command) = self.selected_resume_command() else {
+            self.status = Some("selected session has no id".to_string());
+            return;
+        };
+
+        match arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(command.clone()))
+        {
+            Ok(()) => {
+                self.status = Some(format!("copied: {command}"));
+            }
+            Err(err) => {
+                self.status = Some(format!("clipboard copy failed: {err}"));
+            }
+        }
     }
 
     fn move_next(&mut self) {
@@ -280,9 +339,9 @@ impl App {
     }
 }
 
-fn run_app(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<Option<PathBuf>> {
+fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<AppAction> {
     loop {
-        terminal.draw(|frame| render(frame, &mut app))?;
+        terminal.draw(|frame| render(frame, app))?;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
@@ -292,10 +351,18 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<Opti
 
                 match app.mode {
                     Mode::Normal => match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
-                        KeyCode::Enter => return Ok(app.selected_path()),
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Ok(AppAction::Quit);
+                        }
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(AppAction::Quit),
+                        KeyCode::Enter => {
+                            if let Some(path) = app.selected_path() {
+                                return Ok(AppAction::Replay(path));
+                            }
+                        }
                         KeyCode::Char('/') => app.mode = Mode::Search,
                         KeyCode::Char('?') => app.show_help = !app.show_help,
+                        KeyCode::Char('y') => app.copy_resume_command_to_clipboard(),
                         KeyCode::Tab => app.toggle_focus(),
                         KeyCode::Char('j') | KeyCode::Down => match app.focus {
                             PaneFocus::Sessions => app.move_next(),
@@ -327,6 +394,9 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<Opti
                         _ => {}
                     },
                     Mode::Search => match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Ok(AppAction::Quit);
+                        }
                         KeyCode::Esc => app.mode = Mode::Normal,
                         KeyCode::Enter => app.mode = Mode::Normal,
                         KeyCode::Tab => app.next_search_scope(),
@@ -475,6 +545,12 @@ fn render_message(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let status = app
+        .status
+        .as_deref()
+        .map(|status| format!(" | {status}"))
+        .unwrap_or_default();
+
     let footer = match app.mode {
         Mode::Normal => Line::from(vec![
             Span::raw(" focus: "),
@@ -487,15 +563,18 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(" Tab focus "),
             Span::raw(" / search "),
             Span::raw(" Enter replay "),
+            Span::raw(" y copy-resume "),
             Span::raw(" q quit "),
+            Span::raw(" Ctrl-C quit "),
             Span::raw(" ? help "),
+            Span::styled(status, Style::default().fg(Color::Yellow)),
         ]),
         Mode::Search => Line::from(vec![
             Span::raw(" search: "),
             Span::styled(app.search_scope.label(), Style::default().fg(Color::Cyan)),
             Span::raw(" /"),
             Span::styled(app.query.clone(), Style::default().fg(Color::Yellow)),
-            Span::raw("  Tab scope  Enter accept  Esc cancel  Backspace delete "),
+            Span::raw("  Tab scope  Enter accept  Esc cancel  Ctrl-C quit  Backspace delete "),
         ]),
     }
     .gray();
@@ -536,8 +615,10 @@ fn render_help(frame: &mut Frame) {
         Line::raw(""),
         Line::raw("Other"),
         Line::raw("  Enter           run codex-replay-tui with selected jsonl path"),
+        Line::raw("                  return from replay to this selector when replay exits"),
+        Line::raw("  y               copy `codex resume <session-id>` to clipboard"),
         Line::raw("  ?               toggle help"),
-        Line::raw("  q               quit"),
+        Line::raw("  q / Ctrl-C      quit"),
     ])
     .block(Block::new().title(" Help ").borders(Borders::ALL))
     .wrap(Wrap { trim: false });
@@ -622,6 +703,13 @@ fn filter_sessions_by_scope(
         })
         .cloned()
         .collect()
+}
+
+fn resume_command(row: &SessionRow) -> Option<String> {
+    row.id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| format!("codex resume {id}"))
 }
 
 fn dash_empty(value: &str) -> &str {
@@ -837,5 +925,19 @@ mod tests {
             .join("");
 
         assert!(text.starts_with("/repo/beta"));
+    }
+
+    #[test]
+    fn resume_command_uses_session_id() {
+        let mut rows = sample_rows();
+        rows[0].id = Some("019e6ce6-08f8-77e0-ba64-f303967970e0".to_string());
+
+        assert_eq!(
+            resume_command(&rows[0]).as_deref(),
+            Some("codex resume 019e6ce6-08f8-77e0-ba64-f303967970e0")
+        );
+
+        rows[0].id = None;
+        assert_eq!(resume_command(&rows[0]), None);
     }
 }

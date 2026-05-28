@@ -8,15 +8,35 @@ Repository: <https://github.com/widehyo1/codex-session-selector.git>
 
 - `record-codex-session-info`: scans `~/.codex/sessions/*/*/*/*.jsonl` and writes a SQLite index.
 - `select-codex-session`: opens a ratatui selector, refreshes the SQLite index by default, and runs `codex-replay-tui <jsonl-path>` for the selected session.
-
-`select-codex-session` is designed to work with [codex-replay-tui](https://github.com/widehyo1/codex-replay-tui.git).
+- `codex-replay-tui`: opens a ratatui replay view for one Codex session JSONL file.
 
 ## Install
 
+Install all three binaries from this repository:
+
+```bash
+./install-bundle.sh
+```
+
+By default, the script installs to `~/.local/bin`. Override the destination with:
+
+```bash
+CODEX_CLI_BIN_DIR=~/.cli/bin ./install-bundle.sh
+```
+
+Until crates.io publishing is set up, install directly from Git with:
+
+```bash
+cargo install --git https://github.com/widehyo1/codex-session-selector.git --bins
+```
+
+Manual install:
+
 ```bash
 cargo build --release
-install -m 755 target/release/record-codex-session-info ~/.cli/bin/record-codex-session-info
-install -m 755 target/release/select-codex-session ~/.cli/bin/select-codex-session
+install -m 755 target/release/record-codex-session-info ~/.local/bin/record-codex-session-info
+install -m 755 target/release/select-codex-session ~/.local/bin/select-codex-session
+install -m 755 target/release/codex-replay-tui ~/.local/bin/codex-replay-tui
 ```
 
 ## Usage
@@ -57,9 +77,12 @@ select-codex-session --replay-command /path/to/codex-replay-tui
 - `0`: reset horizontal scroll
 - `/`: interactive search
 - `Tab` while searching: cycle search scope through `all`, `message`, `cwd`, `branch`, `repo`, `date`
-- `Enter`: run `codex-replay-tui` with the selected JSONL path
+- `Enter`: run `codex-replay-tui` with the selected JSONL path, then return to the selector after replay exits
+- `y`: copy `codex resume <session-id>` to the clipboard
 - `?`: help
-- `q` or `Esc`: quit
+- `q`, `Esc`, or `Ctrl-C`: quit
+
+When replay exits, the selector opens again with the previous selection and filter state intact.
 
 ## SQLite Schema
 

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+arboard = "3.4"
 crossterm = "0.29"
 ratatui = "0.30"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -18,3 +19,7 @@ path = "src/bin/record-codex-session-info.rs"
 [[bin]]
 name = "select-codex-session"
 path = "src/bin/select-codex-session.rs"
+
+[[bin]]
+name = "codex-replay-tui"
+path = "src/bin/codex-replay-tui.rs"
