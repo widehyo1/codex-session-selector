@@ -4,6 +4,9 @@ Rust TUI utilities for indexing local Codex session JSONL files and selecting on
 
 Repository: <https://github.com/widehyo1/codex-session-selector.git>
 
+https://github.com/user-attachments/assets/1885c129-d20a-4def-982f-3eb829745c11
+
+
 ## Binaries
 
 - `record-codex-session-info`: scans `~/.codex/sessions/*/*/*/*.jsonl` and writes a SQLite index.
