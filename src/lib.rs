@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -20,10 +21,47 @@ pub struct SessionRow {
     pub is_subsession: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecEvent {
+    pub session_path: PathBuf,
+    pub session_id: Option<String>,
+    pub event_index: usize,
+    pub call_id: Option<String>,
+    pub kind: String,
+    pub name: Option<String>,
+    pub command: String,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct CollectOptions {
     pub include_subsessions: bool,
     pub include_empty_messages: bool,
+    pub include_exec: bool,
+}
+
+impl Default for CollectOptions {
+    fn default() -> Self {
+        Self {
+            include_subsessions: false,
+            include_empty_messages: false,
+            include_exec: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CollectedSessionData {
+    pub rows: Vec<SessionRow>,
+    pub exec_events: Vec<ExecEvent>,
+    pub total_files: usize,
+    pub skipped: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedSessionFile {
+    row: SessionRow,
+    exec_events: Vec<ExecEvent>,
 }
 
 pub fn is_subsession_meta(payload: &Value) -> bool {
@@ -46,11 +84,17 @@ pub fn is_subsession_meta(payload: &Value) -> bool {
 }
 
 pub fn parse_session_file(path: &Path) -> Result<Option<SessionRow>> {
+    Ok(parse_session_file_data(path, false)?.map(|data| data.row))
+}
+
+fn parse_session_file_data(path: &Path, include_exec: bool) -> Result<Option<ParsedSessionFile>> {
     let file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut meta: Option<SessionRow> = None;
     let mut first_message: Option<String> = None;
+    let mut exec_events: Vec<ExecEvent> = Vec::new();
+    let mut exec_by_call_id: HashMap<String, usize> = HashMap::new();
 
     for (line_number, line) in reader.lines().enumerate() {
         let line =
@@ -102,7 +146,18 @@ pub fn parse_session_file(path: &Path) -> Result<Option<SessionRow>> {
             );
         }
 
-        if meta.is_some() && first_message.is_some() {
+        if include_exec {
+            collect_exec_event(
+                path,
+                line_number,
+                record_type,
+                payload,
+                &mut exec_events,
+                &mut exec_by_call_id,
+            );
+        }
+
+        if !include_exec && meta.is_some() && first_message.is_some() {
             break;
         }
     }
@@ -111,7 +166,10 @@ pub fn parse_session_file(path: &Path) -> Result<Option<SessionRow>> {
         return Ok(None);
     };
     row.first_message = first_message.unwrap_or_default();
-    Ok(Some(row))
+    for event in &mut exec_events {
+        event.session_id = row.id.clone();
+    }
+    Ok(Some(ParsedSessionFile { row, exec_events }))
 }
 
 pub fn should_include_row(row: &SessionRow, options: CollectOptions) -> bool {
@@ -164,21 +222,41 @@ pub fn collect_rows(
     sessions_root: &Path,
     options: CollectOptions,
 ) -> Result<(Vec<SessionRow>, usize, usize)> {
+    let data = collect_session_data(sessions_root, options)?;
+
+    Ok((data.rows, data.total_files, data.skipped))
+}
+
+pub fn collect_session_data(
+    sessions_root: &Path,
+    options: CollectOptions,
+) -> Result<CollectedSessionData> {
     let mut paths = session_jsonl_paths(sessions_root)?;
     paths.sort();
 
     let mut rows = Vec::new();
+    let mut exec_events = Vec::new();
     let mut skipped = 0;
     let total = paths.len();
 
     for path in paths {
-        match parse_session_file(&path)? {
-            Some(row) if should_include_row(&row, options) => rows.push(row),
+        match parse_session_file_data(&path, options.include_exec)? {
+            Some(data) if should_include_row(&data.row, options) => {
+                rows.push(data.row);
+                if options.include_exec {
+                    exec_events.extend(data.exec_events);
+                }
+            }
             _ => skipped += 1,
         }
     }
 
-    Ok((rows, total, skipped))
+    Ok(CollectedSessionData {
+        rows,
+        exec_events,
+        total_files: total,
+        skipped,
+    })
 }
 
 pub fn session_jsonl_paths(sessions_root: &Path) -> Result<Vec<PathBuf>> {
@@ -207,6 +285,14 @@ pub fn session_jsonl_paths(sessions_root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub fn recreate_database(db_path: &Path, rows: &[SessionRow]) -> Result<()> {
+    recreate_database_with_exec(db_path, rows, None)
+}
+
+pub fn recreate_database_with_exec(
+    db_path: &Path,
+    rows: &[SessionRow],
+    exec_events: Option<&[ExecEvent]>,
+) -> Result<()> {
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -261,6 +347,62 @@ pub fn recreate_database(db_path: &Path, rows: &[SessionRow]) -> Result<()> {
         [],
     )?;
     conn.execute("CREATE INDEX sessions_cwd_idx ON sessions(cwd)", [])?;
+
+    if let Some(exec_events) = exec_events {
+        conn.execute("DROP TABLE IF EXISTS exec_events", [])?;
+        conn.execute(
+            r#"
+            CREATE TABLE exec_events (
+                session_path TEXT NOT NULL,
+                session_id TEXT,
+                event_index INTEGER NOT NULL,
+                call_id TEXT,
+                kind TEXT NOT NULL,
+                name TEXT,
+                command TEXT,
+                output TEXT
+            )
+            "#,
+            [],
+        )?;
+
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO exec_events (
+                    session_path, session_id, event_index, call_id, kind, name, command, output
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+            )?;
+
+            for event in exec_events {
+                stmt.execute(params![
+                    event.session_path.to_string_lossy().as_ref(),
+                    event.session_id.as_deref(),
+                    event.event_index as i64,
+                    event.call_id.as_deref(),
+                    event.kind.as_str(),
+                    event.name.as_deref(),
+                    event.command.as_str(),
+                    event.output.as_str(),
+                ])?;
+            }
+        }
+        tx.commit()?;
+
+        conn.execute(
+            "CREATE INDEX exec_events_session_path_idx ON exec_events(session_path)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX exec_events_session_id_idx ON exec_events(session_id)",
+            [],
+        )?;
+    } else {
+        conn.execute("DROP TABLE IF EXISTS exec_events", [])?;
+    }
     Ok(())
 }
 
@@ -298,6 +440,150 @@ fn string_field(value: &Value, field: &str) -> Option<String> {
         .get(field)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn collect_exec_event(
+    path: &Path,
+    line_number: usize,
+    record_type: Option<&str>,
+    payload: &Value,
+    exec_events: &mut Vec<ExecEvent>,
+    exec_by_call_id: &mut HashMap<String, usize>,
+) {
+    if record_type == Some("event_msg")
+        && payload.get("type").and_then(Value::as_str) == Some("exec_command_end")
+    {
+        exec_events.push(legacy_exec_event(path, line_number, payload));
+        return;
+    }
+
+    if record_type != Some("response_item") {
+        return;
+    }
+
+    match payload.get("type").and_then(Value::as_str) {
+        Some("custom_tool_call") | Some("function_call") if is_exec_tool_call(payload) => {
+            let call_id = string_field(payload, "call_id");
+            let event = ExecEvent {
+                session_path: path.to_path_buf(),
+                session_id: None,
+                event_index: line_number,
+                call_id: call_id.clone(),
+                kind: payload
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool_call")
+                    .to_string(),
+                name: string_field(payload, "name"),
+                command: exec_tool_command(payload),
+                output: String::new(),
+            };
+            let index = exec_events.len();
+            exec_events.push(event);
+            if let Some(call_id) = call_id {
+                exec_by_call_id.insert(call_id, index);
+            }
+        }
+        Some("custom_tool_call_output") | Some("function_call_output") => {
+            let call_id = string_field(payload, "call_id");
+            let output = payload_text(payload, "output");
+            if let Some(index) = call_id
+                .as_deref()
+                .and_then(|call_id| exec_by_call_id.get(call_id))
+                .copied()
+            {
+                exec_events[index].output = output;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_exec_tool_call(payload: &Value) -> bool {
+    matches!(
+        payload.get("name").and_then(Value::as_str),
+        Some("exec") | Some("exec_command")
+    )
+}
+
+fn exec_tool_command(payload: &Value) -> String {
+    let input = payload_text(payload, "input");
+    let input = if input.trim().is_empty() {
+        payload_text(payload, "arguments")
+    } else {
+        input
+    };
+
+    serde_json::from_str::<Value>(&input)
+        .ok()
+        .and_then(|arguments| {
+            arguments
+                .get("cmd")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or(input)
+}
+
+fn legacy_exec_event(path: &Path, line_number: usize, payload: &Value) -> ExecEvent {
+    let parsed_cmd = payload
+        .get("parsed_cmd")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let command = parsed_cmd
+        .iter()
+        .filter_map(|cmd| cmd.get("cmd").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let name = parsed_cmd.iter().find_map(command_name);
+
+    ExecEvent {
+        session_path: path.to_path_buf(),
+        session_id: None,
+        event_index: line_number,
+        call_id: None,
+        kind: "exec_command_end".to_string(),
+        name,
+        command,
+        output: payload_text(payload, "aggregated_output"),
+    }
+}
+
+fn command_name(cmd: &Value) -> Option<String> {
+    ["name", "path", "type"]
+        .iter()
+        .filter_map(|field| cmd.get(field).and_then(Value::as_str))
+        .find(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn payload_text(payload: &Value, field: &str) -> String {
+    let Some(value) = payload.get(field) else {
+        return String::new();
+    };
+
+    value_to_text(value)
+}
+
+fn value_to_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(value) => value.clone(),
+        Value::Array(values) => values
+            .iter()
+            .map(value_to_text)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(object) => object
+            .get("text")
+            .and_then(Value::as_str)
+            .or_else(|| object.get("output").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| value.to_string()),
+        _ => value.to_string(),
+    }
 }
 
 fn read_dirs(path: &Path) -> Result<Vec<PathBuf>> {
@@ -354,6 +640,98 @@ mod tests {
             }
         });
         fs::write(path, format!("{meta}\n{user}\n")).unwrap();
+    }
+
+    fn write_jsonl_with_exec(path: &Path) {
+        let meta = json!({
+            "type": "session_meta",
+            "payload": {
+                "id": "session-id",
+                "timestamp": "2026-05-28T00:00:00Z",
+                "cwd": "/repo/demo",
+                "source": "cli",
+                "thread_source": "user",
+                "git": {
+                    "repository_url": "https://git.example/demo.git",
+                    "branch": "main"
+                }
+            }
+        });
+        let user = json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "real user request"
+            }
+        });
+        let legacy_exec = json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "exec_command_end",
+                "parsed_cmd": [
+                    {
+                        "type": "read",
+                        "cmd": "sed -n '1,80p' README.md",
+                        "name": "README.md"
+                    }
+                ],
+                "aggregated_output": "# Title"
+            }
+        });
+        let tool_call = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "call-1",
+                "name": "exec",
+                "input": "const r = await tools.exec_command({\"cmd\":\"pwd\"});",
+                "status": "completed"
+            }
+        });
+        let tool_output = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call-1",
+                "output": [
+                    {"type": "input_text", "text": "Script completed"},
+                    {"type": "input_text", "text": "/repo/demo"}
+                ]
+            }
+        });
+        let legacy_tool_call = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": "call-2",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"git status --short\",\"workdir\":\"/repo/demo\"}"
+            }
+        });
+        let legacy_tool_output = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call-2",
+                "output": " M README.md"
+            }
+        });
+        let unmatched_output = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "non-exec-call",
+                "output": "not an exec result"
+            }
+        });
+
+        fs::write(
+            path,
+            format!(
+                "{meta}\n{user}\n{legacy_exec}\n{tool_call}\n{tool_output}\n{legacy_tool_call}\n{legacy_tool_output}\n{unmatched_output}\n"
+            ),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -453,5 +831,91 @@ mod tests {
             filter_sessions(&rows, "2026-05-28")[0].path,
             PathBuf::from("/tmp/b.jsonl")
         );
+    }
+
+    #[test]
+    fn collect_session_data_omits_exec_by_default_and_collects_when_enabled() {
+        let root = temp_path("sessions");
+        let day = root.join("2026").join("05").join("28");
+        fs::create_dir_all(&day).unwrap();
+        let path = day.join("rollout.jsonl");
+        write_jsonl_with_exec(&path);
+
+        let default_data = collect_session_data(&root, CollectOptions::default()).unwrap();
+        assert_eq!(default_data.rows.len(), 1);
+        assert_eq!(default_data.exec_events.len(), 0);
+
+        let with_exec = collect_session_data(
+            &root,
+            CollectOptions {
+                include_exec: true,
+                ..CollectOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(with_exec.rows.len(), 1);
+        assert_eq!(with_exec.exec_events.len(), 3);
+        assert_eq!(with_exec.exec_events[0].kind, "exec_command_end");
+        assert_eq!(with_exec.exec_events[0].name.as_deref(), Some("README.md"));
+        assert_eq!(with_exec.exec_events[0].command, "sed -n '1,80p' README.md");
+        assert_eq!(with_exec.exec_events[0].output, "# Title");
+        assert_eq!(with_exec.exec_events[1].kind, "custom_tool_call");
+        assert_eq!(with_exec.exec_events[1].call_id.as_deref(), Some("call-1"));
+        assert!(
+            with_exec.exec_events[1]
+                .command
+                .contains("tools.exec_command")
+        );
+        assert!(with_exec.exec_events[1].output.contains("Script completed"));
+        assert!(with_exec.exec_events[1].output.contains("/repo/demo"));
+        assert_eq!(with_exec.exec_events[2].kind, "function_call");
+        assert_eq!(
+            with_exec.exec_events[2].name.as_deref(),
+            Some("exec_command")
+        );
+        assert_eq!(with_exec.exec_events[2].command, "git status --short");
+        assert_eq!(with_exec.exec_events[2].output, " M README.md");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recreate_database_creates_exec_table_only_when_requested() {
+        let db_path = temp_path("sessions.sqlite3");
+        let row = SessionRow {
+            path: PathBuf::from("/tmp/session.jsonl"),
+            id: Some("session-id".to_string()),
+            timestamp: Some("2026-05-28T00:00:00Z".to_string()),
+            cwd: Some("/repo/demo".to_string()),
+            repository_url: Some("https://git.example/demo.git".to_string()),
+            branch: Some("main".to_string()),
+            first_message: "real user request".to_string(),
+            is_subsession: false,
+        };
+        let exec = ExecEvent {
+            session_path: row.path.clone(),
+            session_id: row.id.clone(),
+            event_index: 2,
+            call_id: Some("call-1".to_string()),
+            kind: "custom_tool_call".to_string(),
+            name: Some("exec".to_string()),
+            command: "pwd".to_string(),
+            output: "/repo/demo".to_string(),
+        };
+
+        recreate_database(&db_path, std::slice::from_ref(&row)).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert!(conn.prepare("SELECT count(*) FROM exec_events").is_err());
+        drop(conn);
+
+        recreate_database_with_exec(&db_path, &[row], Some(&[exec])).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM exec_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let _ = fs::remove_file(db_path);
     }
 }

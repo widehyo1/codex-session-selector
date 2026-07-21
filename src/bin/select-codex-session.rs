@@ -48,7 +48,11 @@ fn main() -> Result<()> {
         match action? {
             AppAction::Quit => return Ok(()),
             AppAction::Replay(path) => {
-                let status = Command::new(&args.replay_command).arg(path).status()?;
+                let mut command = Command::new(&args.replay_command);
+                if args.include_exec {
+                    command.arg("--include-exec");
+                }
+                let status = command.arg(path).status()?;
                 app.status = if status.success() {
                     None
                 } else {
@@ -69,6 +73,7 @@ struct Args {
     record_command: String,
     refresh: bool,
     print_path: bool,
+    include_exec: bool,
 }
 
 impl Args {
@@ -76,9 +81,10 @@ impl Args {
         let mut parsed = Self {
             db: home_dir()?.join("codex-session-info.sqlite3"),
             replay_command: "codex-replay-tui".to_string(),
-            record_command: "record-codex-session-info".to_string(),
+            record_command: default_record_command(),
             refresh: true,
             print_path: false,
+            include_exec: false,
         };
 
         while let Some(arg) = args.next() {
@@ -103,8 +109,13 @@ impl Args {
                 }
                 "--no-refresh" => parsed.refresh = false,
                 "--print-path" => parsed.print_path = true,
+                "--include-exec" => parsed.include_exec = true,
                 "-h" | "--help" => {
                     print_help();
+                    std::process::exit(0);
+                }
+                "-V" | "--version" => {
+                    println!("select-codex-session {}", env!("CARGO_PKG_VERSION"));
                     std::process::exit(0);
                 }
                 _ => bail!("unknown argument: {arg}"),
@@ -117,7 +128,7 @@ impl Args {
 
 fn refresh_database(args: &Args) -> Result<()> {
     let status = Command::new(&args.record_command)
-        .args(record_command_args(&args.db))
+        .args(record_command_args(&args.db, args.include_exec))
         .status()?;
 
     if !status.success() {
@@ -131,8 +142,27 @@ fn refresh_database(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn record_command_args(db: &std::path::Path) -> Vec<String> {
-    vec!["--output".to_string(), db.to_string_lossy().to_string()]
+fn record_command_args(db: &std::path::Path, include_exec: bool) -> Vec<String> {
+    let mut args = vec!["--output".to_string(), db.to_string_lossy().to_string()];
+    if include_exec {
+        args.push("--include-exec".to_string());
+    }
+    args
+}
+
+fn default_record_command() -> String {
+    env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(default_record_command_from_exe)
+        .unwrap_or_else(|| "record-codex-session-info".to_string())
+}
+
+fn default_record_command_from_exe(exe: &std::path::Path) -> Option<String> {
+    let candidate = exe.parent()?.join("record-codex-session-info");
+    candidate
+        .exists()
+        .then(|| candidate.to_string_lossy().to_string())
 }
 
 fn restore_terminal() {
@@ -790,7 +820,37 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 fn print_help() {
     println!(
-        "usage: select-codex-session [--db PATH] [--record-command COMMAND] [--no-refresh] [--replay-command COMMAND] [--print-path]"
+        "\
+select-codex-session {version}
+
+Open a TUI for choosing a local Codex session and replaying its JSONL timeline.
+
+Usage:
+  select-codex-session [OPTIONS]
+
+Options:
+      --db PATH                  SQLite index path
+                                 default: ~/codex-session-info.sqlite3
+      --record-command COMMAND   Recorder binary used during refresh
+                                 default: sibling record-codex-session-info, then PATH
+      --replay-command COMMAND   Replay binary used after selection
+                                 default: codex-replay-tui
+      --no-refresh               Do not rebuild the SQLite index before opening
+      --include-exec             Index and show command execution records
+                                 passed to recorder during refresh and replay after selection
+      --print-path               Print the selected JSONL path instead of replaying
+  -h, --help                     Show this help
+  -V, --version                  Show version
+
+Keys:
+  Enter                          replay selected session, then return here
+  /                              interactive search
+  Tab                            switch pane focus; while searching, cycle search scope
+  h/l or Left/Right              horizontal scroll in sessions pane
+  y                              copy `codex resume <session-id>` to clipboard
+  q, Esc, Ctrl-C                 quit
+",
+        version = env!("CARGO_PKG_VERSION")
     );
 }
 
@@ -844,19 +904,51 @@ mod tests {
     #[test]
     fn record_command_args_write_to_selected_db() {
         assert_eq!(
-            record_command_args(Path::new("/tmp/session.sqlite3")),
+            record_command_args(Path::new("/tmp/session.sqlite3"), false),
             vec!["--output".to_string(), "/tmp/session.sqlite3".to_string()]
         );
+        assert_eq!(
+            record_command_args(Path::new("/tmp/session.sqlite3"), true),
+            vec![
+                "--output".to_string(),
+                "/tmp/session.sqlite3".to_string(),
+                "--include-exec".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn default_record_command_prefers_sibling_binary() {
+        let dir = std::env::temp_dir().join(format!(
+            "codex-session-selector-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("select-codex-session");
+        let recorder = dir.join("record-codex-session-info");
+        std::fs::write(&recorder, "").unwrap();
+
+        assert_eq!(
+            default_record_command_from_exe(&exe),
+            Some(recorder.to_string_lossy().to_string())
+        );
+
+        let _ = std::fs::remove_file(recorder);
+        let _ = std::fs::remove_dir(dir);
     }
 
     #[test]
     fn args_refresh_by_default_and_can_disable_it() {
         let args = Args::parse(std::iter::empty()).unwrap();
         assert!(args.refresh);
-        assert_eq!(args.record_command, "record-codex-session-info");
+        assert!(args.record_command.ends_with("record-codex-session-info"));
+        assert!(!args.include_exec);
 
         let args = Args::parse(["--no-refresh".to_string()].into_iter()).unwrap();
         assert!(!args.refresh);
+
+        let args = Args::parse(["--include-exec".to_string()].into_iter()).unwrap();
+        assert!(args.include_exec);
     }
 
     #[test]
