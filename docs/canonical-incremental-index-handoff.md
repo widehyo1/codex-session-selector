@@ -787,20 +787,28 @@ deterministic하게 관찰 가능한 경계를 사용한다.
 
 | files | fresh median | no-op median | one-change median | delete median | DB bytes |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 100 |  |  |  |  |  |
-| 1,000 |  |  |  |  |  |
-| 10,000 |  |  |  |  |  |
+| 100 | 374.686 ms | 62.773 ms | 83.589 ms | 57.950 ms | 1,613,824 |
+| 1,000 | 1.928 s | 164.130 ms | 179.655 ms | 683.339 ms | 15,683,584 |
+| 10,000 | 16.538 s | 622.021 ms | 551.825 ms | 550.472 ms | 156,573,696 |
 
 측정 환경:
 
 ```text
-OS:
-CPU:
-filesystem:
-rustc:
+OS: Linux 6.18.33.2-microsoft-standard-WSL2 x86_64
+CPU: Intel Core i7-8665U, 4 cores / 8 threads
+filesystem: ext4
+rustc: 1.97.1 (8bab26f4f 2026-07-14)
 profile: release
-SQLite:
+SQLite: bundled 3.53.2
 ```
+
+2026-07-27 구현 측정은
+`cargo test --release canonical_incremental_benchmark -- --ignored --nocapture`
+로 실행했다. 각 case는 계획대로 warm-up 1회 후 5회 median이다. legacy
+include-all+exec DB 크기는 각각 1,540,096, 15,138,816, 151,183,360 bytes로,
+canonical/legacy 비율은 약 1.048, 1.036, 1.036이었다. no-op은 모든 규모에서
+`parsed_files = 0`, one-change는 `parsed_files = 1`, delete는
+`parsed_files = 0`과 `deleted_files = 1`을 확인했다.
 
 완료를 막는 조건:
 

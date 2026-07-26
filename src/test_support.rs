@@ -36,6 +36,67 @@ impl SessionFixture {
         write_jsonl_with_exec(&path);
         path
     }
+
+    pub(crate) fn write_named_session(
+        &self,
+        name: &str,
+        message: &str,
+        subsession: bool,
+    ) -> PathBuf {
+        let day = self.sessions_root().join("2026").join("07").join("26");
+        std::fs::create_dir_all(&day).unwrap();
+        let path = day.join(name);
+        let source = if subsession {
+            json!({"subagent": {"thread_spawn": {"parent_thread_id": "parent"}}})
+        } else {
+            json!("cli")
+        };
+        let records = [
+            json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": format!("session-{name}"),
+                    "timestamp": "2026-07-26T01:00:00Z",
+                    "cwd": "/repo/demo path",
+                    "source": source,
+                    "thread_source": if subsession { "subagent" } else { "user" },
+                    "git": {
+                        "repository_url": "https://git.example/demo.git",
+                        "branch": "main"
+                    }
+                }
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": message}
+            }),
+        ];
+        let contents = records
+            .into_iter()
+            .map(|record| record.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{contents}\n")).unwrap();
+        path
+    }
+
+    pub(crate) fn write_no_meta(&self, name: &str) -> PathBuf {
+        let day = self.sessions_root().join("2026").join("07").join("26");
+        std::fs::create_dir_all(&day).unwrap();
+        let path = day.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "orphan"}
+                })
+            ),
+        )
+        .unwrap();
+        path
+    }
 }
 
 impl Drop for SessionFixture {

@@ -3,7 +3,7 @@ name = "codex-session-selector"
 version = "0.3.0"
 autobins = false
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.97"
 description = "TUI utilities for indexing, selecting, and replaying local Codex session JSONL files."
 repository = "https://github.com/widehyo1/codex-session-selector"
 readme = "README.md"
@@ -16,7 +16,7 @@ anyhow = "1"
 arboard = "3.4"
 crossterm = "0.29"
 ratatui = "0.30"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 
 use crate::{
     cli::{Command, IndexOptions, ReplayOptions, SelectOptions},
-    indexer, load_sessions, replay,
+    indexer, replay,
     selector::{self, SelectorAction, SelectorApp},
     ui_state::ExecVisibility,
 };
@@ -24,8 +24,8 @@ pub(crate) fn run(command: Command) -> Result<()> {
 }
 
 fn run_index(options: IndexOptions) -> Result<()> {
-    let summary = indexer::build_index(&options)?;
-    println!("{}", indexer::format_summary(&summary));
+    let outcome = indexer::build_index(&options)?;
+    println!("{}", indexer::format_summary(&outcome.summary));
     Ok(())
 }
 
@@ -34,7 +34,13 @@ fn run_select(options: SelectOptions) -> Result<()> {
         refresh_database(&options)?;
     }
 
-    let rows = load_sessions(&options.db)?;
+    let rows = indexer::store::load_sessions_with_view(
+        &options.db,
+        indexer::store::SessionView {
+            include_subsessions: options.include_subsessions,
+            include_empty_messages: options.include_empty_messages,
+        },
+    )?;
     if rows.is_empty() {
         bail!("no sessions found in {}", options.db.display());
     }
@@ -73,16 +79,30 @@ fn refresh_database(options: &SelectOptions) -> Result<()> {
     let defaults = IndexOptions::defaults()?;
     let index_options = IndexOptions {
         output: options.db.clone(),
-        include_exec: options.include_exec,
+        rebuild: false,
+        include_subsessions: false,
+        include_empty_messages: false,
+        include_exec: false,
         ..defaults
     };
-    let summary = indexer::build_index(&index_options)?;
-    println!("{}", indexer::format_summary(&summary));
+    let outcome = indexer::build_index(&index_options)?;
+    println!("{}", indexer::format_summary(&outcome.summary));
     Ok(())
 }
 
-fn external_record_args(db: &Path, include_exec: bool) -> Vec<String> {
+fn external_record_args(
+    db: &Path,
+    include_subsessions: bool,
+    include_empty_messages: bool,
+    include_exec: bool,
+) -> Vec<String> {
     let mut args = vec!["--output".to_string(), db.to_string_lossy().to_string()];
+    if include_subsessions {
+        args.push("--include-subsessions".to_string());
+    }
+    if include_empty_messages {
+        args.push("--include-empty-messages".to_string());
+    }
     if include_exec {
         args.push("--include-exec".to_string());
     }
@@ -91,7 +111,12 @@ fn external_record_args(db: &Path, include_exec: bool) -> Vec<String> {
 
 fn run_external_refresh(program: &str, options: &SelectOptions) -> Result<()> {
     let status = std::process::Command::new(program)
-        .args(external_record_args(&options.db, options.include_exec))
+        .args(external_record_args(
+            &options.db,
+            options.include_subsessions,
+            options.include_empty_messages,
+            options.include_exec,
+        ))
         .status()?;
 
     if !status.success() {
@@ -153,14 +178,16 @@ mod tests {
     #[test]
     fn external_record_args_match_legacy_contract() {
         assert_eq!(
-            external_record_args(Path::new("/tmp/index.sqlite3"), false),
+            external_record_args(Path::new("/tmp/index.sqlite3"), false, false, false),
             vec!["--output".to_string(), "/tmp/index.sqlite3".to_string(),]
         );
         assert_eq!(
-            external_record_args(Path::new("/tmp/index.sqlite3"), true),
+            external_record_args(Path::new("/tmp/index.sqlite3"), true, true, true),
             vec![
                 "--output".to_string(),
                 "/tmp/index.sqlite3".to_string(),
+                "--include-subsessions".to_string(),
+                "--include-empty-messages".to_string(),
                 "--include-exec".to_string(),
             ]
         );

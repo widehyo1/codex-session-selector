@@ -466,15 +466,15 @@ fn run_event_loop(
     loop {
         terminal.draw(|frame| render(frame, &mut app))?;
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
 
-                if app.handle_key(key) == ReplayControl::Quit {
-                    return Ok(app.exec_visibility);
-                }
+            if app.handle_key(key) == ReplayControl::Quit {
+                return Ok(app.exec_visibility);
             }
         }
     }
@@ -771,10 +771,10 @@ fn value_text(value: &serde_json::Value) -> String {
 }
 
 fn extract_exec_command(input: &str) -> Option<String> {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(input) {
-        if let Some(cmd) = value.get("cmd").and_then(serde_json::Value::as_str) {
-            return Some(cmd.to_string());
-        }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(input)
+        && let Some(cmd) = value.get("cmd").and_then(serde_json::Value::as_str)
+    {
+        return Some(cmd.to_string());
     }
 
     let marker = "tools.exec_command(";
@@ -817,16 +817,16 @@ fn json_object_at(input: &str) -> Option<&str> {
 }
 
 fn format_cmd_summary(cmd: &ParsedCmd) -> String {
-    if let Some(name) = &cmd.name {
-        if !name.is_empty() {
-            return name.clone();
-        }
+    if let Some(name) = &cmd.name
+        && !name.is_empty()
+    {
+        return name.clone();
     }
 
-    if let Some(path) = &cmd.path {
-        if !path.is_empty() {
-            return path.clone();
-        }
+    if let Some(path) = &cmd.path
+        && !path.is_empty()
+    {
+        return path.clone();
     }
 
     let one_line = cmd.cmd.replace('\n', " ");

@@ -77,9 +77,9 @@ pub struct CollectedSessionData {
 }
 
 #[derive(Debug, Clone)]
-struct ParsedSessionFile {
-    row: SessionRow,
-    exec_events: Vec<ExecEvent>,
+pub(crate) struct ParsedSessionFile {
+    pub(crate) row: SessionRow,
+    pub(crate) exec_events: Vec<ExecEvent>,
 }
 
 pub fn is_subsession_meta(payload: &Value) -> bool {
@@ -105,7 +105,10 @@ pub fn parse_session_file(path: &Path) -> Result<Option<SessionRow>> {
     Ok(parse_session_file_data(path, false)?.map(|data| data.row))
 }
 
-fn parse_session_file_data(path: &Path, include_exec: bool) -> Result<Option<ParsedSessionFile>> {
+pub(crate) fn parse_session_file_data(
+    path: &Path,
+    include_exec: bool,
+) -> Result<Option<ParsedSessionFile>> {
     let file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
@@ -425,32 +428,7 @@ pub fn recreate_database_with_exec(
 }
 
 pub fn load_sessions(db_path: &Path) -> Result<Vec<SessionRow>> {
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("failed to open {}", db_path.display()))?;
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT path, id, timestamp, cwd, repository_url, branch, first_message
-        FROM sessions
-        ORDER BY timestamp DESC
-        "#,
-    )?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(SessionRow {
-                path: PathBuf::from(row.get::<_, String>(0)?),
-                id: row.get(1)?,
-                timestamp: row.get(2)?,
-                cwd: row.get(3)?,
-                repository_url: row.get(4)?,
-                branch: row.get(5)?,
-                first_message: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                is_subsession: false,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    Ok(rows)
+    indexer::store::load_sessions_with_view(db_path, indexer::store::SessionView::default())
 }
 
 fn string_field(value: &Value, field: &str) -> Option<String> {
@@ -700,6 +678,31 @@ mod tests {
         assert_eq!(row.first_message, "real user request");
         assert!(!row.is_subsession);
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_json_line_is_skipped_before_valid_session_records() {
+        let path = temp_path("invalid-then-valid.jsonl");
+        let meta = json!({
+            "type": "session_meta",
+            "payload": {
+                "id": "valid-after-warning",
+                "timestamp": "2026-07-27T00:00:00Z",
+                "cwd": "/repo/demo",
+                "source": "cli",
+                "thread_source": "user"
+            }
+        });
+        let user = json!({
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "valid message"}
+        });
+        fs::write(&path, format!("not-json\n{meta}\n{user}\n")).unwrap();
+
+        let row = parse_session_file(&path).unwrap().unwrap();
+        assert_eq!(row.id.as_deref(), Some("valid-after-warning"));
+        assert_eq!(row.first_message, "valid message");
         let _ = fs::remove_file(path);
     }
 

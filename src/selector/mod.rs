@@ -360,15 +360,15 @@ fn run_event_loop(
     loop {
         terminal.draw(|frame| render(frame, app))?;
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
 
-                if let Some(action) = app.handle_key(key) {
-                    return Ok(action);
-                }
+            if let Some(action) = app.handle_key(key) {
+                return Ok(action);
             }
         }
     }

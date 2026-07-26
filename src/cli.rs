@@ -28,6 +28,8 @@ pub(crate) struct SelectOptions {
     pub db: PathBuf,
     pub refresh: bool,
     pub print_path: bool,
+    pub include_subsessions: bool,
+    pub include_empty_messages: bool,
     pub include_exec: bool,
     pub record_command: Option<String>,
     pub replay_command: Option<String>,
@@ -37,6 +39,7 @@ pub(crate) struct SelectOptions {
 pub(crate) struct IndexOptions {
     pub output: PathBuf,
     pub sessions_root: PathBuf,
+    pub rebuild: bool,
     pub include_subsessions: bool,
     pub include_empty_messages: bool,
     pub include_exec: bool,
@@ -54,6 +57,8 @@ impl SelectOptions {
             db: home_dir()?.join("codex-session-info.sqlite3"),
             refresh: true,
             print_path: false,
+            include_subsessions: false,
+            include_empty_messages: false,
             include_exec: false,
             record_command: None,
             replay_command: None,
@@ -67,6 +72,7 @@ impl IndexOptions {
         Ok(Self {
             output: home.join("codex-session-info.sqlite3"),
             sessions_root: home.join(".codex").join("sessions"),
+            rebuild: false,
             include_subsessions: false,
             include_empty_messages: false,
             include_exec: false,
@@ -114,6 +120,8 @@ fn parse_select_args(args: impl Iterator<Item = String>) -> Result<CliAction> {
             }
             "--no-refresh" => options.refresh = false,
             "--print-path" => options.print_path = true,
+            "--include-subsessions" => options.include_subsessions = true,
+            "--include-empty-messages" => options.include_empty_messages = true,
             "--include-exec" => options.include_exec = true,
             "-h" | "--help" => return Ok(CliAction::PrintHelp(HelpTopic::Root)),
             "-V" | "--version" => return Ok(CliAction::PrintVersion),
@@ -135,6 +143,7 @@ fn parse_index_args(mut args: impl Iterator<Item = String>) -> Result<CliAction>
             "--sessions-root" => {
                 options.sessions_root = expand_home(&required_value(&mut args, &arg, "path")?)?;
             }
+            "--rebuild" => options.rebuild = true,
             "--include-subsessions" => options.include_subsessions = true,
             "--include-empty-messages" => options.include_empty_messages = true,
             "--include-exec" => options.include_exec = true,
@@ -227,8 +236,10 @@ Selector options:
                                  default: internal indexer
       --replay-command COMMAND   Optional external replay override
                                  default: internal replay
-      --no-refresh               Do not rebuild the SQLite index before opening
-      --include-exec             Index exec records and initially show them
+      --no-refresh               Do not refresh the SQLite index before opening
+      --include-subsessions      Show subsessions from the canonical index
+      --include-empty-messages   Show sessions without a non-empty first message
+      --include-exec             Initially show exec records in replay
       --print-path               Print the selected JSONL path instead of replaying
   -h, --help                     Show this help
   -V, --version                  Show version
@@ -260,18 +271,15 @@ Options:
                                  default: ~/codex-session-info.sqlite3
       --sessions-root PATH       Codex sessions root
                                  default: ~/.codex/sessions
-      --include-subsessions      Include subagent/subsession records
-      --include-empty-messages   Include sessions without a first user message
-      --include-exec             Also create and populate exec_events
-                                 default: disabled
+      --include-subsessions      Compatibility option; canonical index always stores subsessions
+      --include-empty-messages   Compatibility option; canonical index always stores empty messages
+      --include-exec             Compatibility option; canonical index always stores exec events
+      --rebuild                  Ignore fingerprints and rebuild the canonical index
   -h, --help                     Show this help
   -V, --version                  Show version
 
-Default schema:
-  sessions(path, id, timestamp, cwd, repository_url, branch, first_message)
-
-With --include-exec:
-  exec_events(session_path, session_id, event_index, call_id, kind, name, command, output)",
+The canonical index always stores all valid sessions and exec events. Selector
+visibility is controlled by selector options rather than index contents.",
         version = env!("CARGO_PKG_VERSION")
     )
 }
@@ -326,6 +334,8 @@ mod tests {
         };
         assert!(options.refresh);
         assert!(!options.print_path);
+        assert!(!options.include_subsessions);
+        assert!(!options.include_empty_messages);
         assert!(!options.include_exec);
         assert_eq!(options.record_command, None);
         assert_eq!(options.replay_command, None);
@@ -338,6 +348,8 @@ mod tests {
             "/tmp/sessions.sqlite3",
             "--no-refresh",
             "--print-path",
+            "--include-subsessions",
+            "--include-empty-messages",
             "--include-exec",
             "--record-command",
             "/tmp/recorder",
@@ -351,6 +363,8 @@ mod tests {
         assert_eq!(options.db, PathBuf::from("/tmp/sessions.sqlite3"));
         assert!(!options.refresh);
         assert!(options.print_path);
+        assert!(options.include_subsessions);
+        assert!(options.include_empty_messages);
         assert!(options.include_exec);
         assert_eq!(options.record_command.as_deref(), Some("/tmp/recorder"));
         assert_eq!(options.replay_command.as_deref(), Some("/tmp/replay"));
@@ -367,6 +381,7 @@ mod tests {
             "--include-subsessions",
             "--include-empty-messages",
             "--include-exec",
+            "--rebuild",
         ]))
         .unwrap();
         let CliAction::Run(Command::Index(options)) = action else {
@@ -377,6 +392,7 @@ mod tests {
         assert!(options.include_subsessions);
         assert!(options.include_empty_messages);
         assert!(options.include_exec);
+        assert!(options.rebuild);
     }
 
     #[test]
@@ -429,13 +445,15 @@ mod tests {
         let root = help_text(HelpTopic::Root);
         assert!(root.contains("select-codex-session index"));
         assert!(root.contains("select-codex-session replay"));
-        assert!(root.contains("Index exec records and initially show them"));
+        assert!(root.contains("Show subsessions from the canonical index"));
+        assert!(root.contains("Initially show exec records in replay"));
         assert!(root.contains("e                              toggle exec entries for replay"));
         assert!(!root.ends_with('\n'));
 
         let index = help_text(HelpTopic::Index);
         assert!(index.contains("--include-empty-messages"));
-        assert!(index.contains("Also create and populate exec_events"));
+        assert!(index.contains("Compatibility option; canonical index always stores exec events"));
+        assert!(index.contains("Ignore fingerprints and rebuild the canonical index"));
 
         let replay = help_text(HelpTopic::Replay);
         assert!(replay.contains("[PATH|-]"));

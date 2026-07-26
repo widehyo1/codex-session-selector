@@ -17,7 +17,7 @@ The package installs one executable:
 
 ## Install
 
-Building from source requires Rust 1.85 or newer.
+Building from source requires Rust 1.97 or newer.
 
 ```bash
 cargo install codex-session-selector
@@ -50,13 +50,13 @@ Open the selector:
 select-codex-session
 ```
 
-Before opening, it rebuilds `~/codex-session-info.sqlite3` from
+Before opening, it incrementally refreshes `~/codex-session-info.sqlite3` from
 `~/.codex/sessions`. Choose a session with `Enter`; when replay exits, the
 selector returns with its selection, query, search scope, and focus intact.
 
-Command-execution records are hidden and not indexed by default. To index them
-and initially show legacy `exec_command_end` records plus newer
-`exec`/`exec_command` tool calls and their matching outputs:
+The canonical index always stores command-execution records. They remain hidden
+in replay by default. To initially show legacy `exec_command_end` records plus
+newer `exec`/`exec_command` tool calls and their matching outputs:
 
 ```bash
 select-codex-session --include-exec
@@ -73,6 +73,8 @@ Useful options:
 select-codex-session --no-refresh
 select-codex-session --db /tmp/sessions.sqlite3
 select-codex-session --print-path
+select-codex-session --include-subsessions
+select-codex-session --include-empty-messages
 ```
 
 Selector options:
@@ -82,6 +84,8 @@ Selector options:
 --record-command COMMAND
 --replay-command COMMAND
 --no-refresh
+--include-subsessions
+--include-empty-messages
 --include-exec
 --print-path
 -h, --help
@@ -117,22 +121,25 @@ next replay starts in the same state. An external `--replay-command` receives
 the visibility that was active when it started, but visibility changes inside
 that separate process are not returned to the selector.
 
+The selector hides subsessions and sessions without a non-empty first message
+by default, matching earlier releases. `--include-subsessions` and
+`--include-empty-messages` expose those rows from the canonical index without
+rebuilding or changing its stored contents.
+
 ## Index
 
-Build or replace the default index:
+Refresh the default index:
 
 ```bash
 select-codex-session index
 ```
 
-Use custom paths, include normally filtered sessions, or index command
-execution records:
+Use custom paths or force a full rebuild:
 
 ```bash
 select-codex-session index --output /tmp/sessions.sqlite3
 select-codex-session index --sessions-root /path/to/.codex/sessions
-select-codex-session index --include-subsessions --include-empty-messages
-select-codex-session index --include-exec
+select-codex-session index --rebuild
 ```
 
 Index options:
@@ -140,6 +147,7 @@ Index options:
 ```text
 -o, --output PATH
 --sessions-root PATH
+--rebuild
 --include-subsessions
 --include-empty-messages
 --include-exec
@@ -147,9 +155,19 @@ Index options:
 -V, --version
 ```
 
-Subsessions are excluded by default using `session_meta.payload`:
-`source.subagent`, `thread_source == "subagent"`, or a non-empty `agent_role`.
-Sessions without a first user message are also excluded by default.
+The three `index --include-*` options remain accepted for script compatibility,
+but they are no-ops: the canonical index always stores subsessions, empty
+messages, and exec events. Use the corresponding root selector options to
+change the visible session set. Subsessions are recognized using
+`session_meta.payload.source.subagent`, `thread_source == "subagent"`, or a
+non-empty `agent_role`.
+
+Refresh uses each JSONL path, size, and modification timestamp. Unchanged files
+are not opened or parsed; new and changed files alone are parsed, and rows for
+deleted files are removed in the same transaction. A file that changes during
+both parse attempts is deferred until the next refresh. Content rewritten to
+the same size with its timestamp restored cannot be detected by this
+fingerprint; `index --rebuild` is the recovery path.
 
 ## Replay
 
@@ -197,32 +215,47 @@ codex-replay-tui ARGS           → select-codex-session replay ARGS
 
 Upgrading does not automatically delete previously installed standalone
 executables. Remove old copies manually after confirming their install path.
-The existing `~/codex-session-info.sqlite3` remains compatible.
+An existing seven-column legacy database remains readable with `--no-refresh`.
+The next refresh transactionally rebuilds it from source JSONL into the
+canonical schema. Changing `--sessions-root` for an existing canonical database
+also causes an automatic full rebuild. A newer schema version is never
+overwritten; an unknown schema requires explicit `index --rebuild`.
 
 ## SQLite schema
 
-The default index contains:
+The crate uses `rusqlite 0.40.1` with bundled SQLite `3.53.2`.
+
+The index uses `PRAGMA user_version = 1` and contains four STRICT tables:
 
 ```text
-sessions(path, id, timestamp, cwd, repository_url, branch, first_message)
-```
-
-With `select-codex-session index --include-exec`, it also contains:
-
-```text
+index_metadata(singleton, sessions_root)
+source_files(
+  source_key, path, file_size, modified_secs, modified_nanos, parse_status
+)
+sessions(
+  path, id, timestamp, cwd, repository_url, branch, first_message,
+  session_key, source_key, is_subsession, has_nonempty_first_message
+)
 exec_events(
   session_path, session_id, event_index, call_id,
-  kind, name, command, output
+  kind, name, command, output, exec_key, session_key
 )
 ```
 
-Indexing recreates `sessions`. Without `--include-exec`, `exec_events` is
-removed; with it, that table is recreated and populated. Replay reads JSONL
-directly rather than using `exec_events`. The TUI `e` toggle only changes the
-in-memory replay view; it does not rebuild SQLite or add/remove tables.
+`source_key` is stable for an unchanged source path, `session_key` is stable for
+that source, and `exec_key` is stable for the same session and JSONL
+`event_index` across incremental updates. File rename, root change, legacy
+migration, and forced rebuild may assign new keys. Foreign keys cascade source
+deletions through sessions and exec events.
 
-The index still uses a full rebuild. A canonical, incremental index is not part
-of this visibility feature and has not been implemented yet.
+All writes, including legacy migration and full rebuild, use one immediate
+transaction and validate foreign keys and SQLite integrity before commit.
+`sessions` and `exec_events` always exist. Replay still reads JSONL directly;
+the TUI `e` toggle only changes the in-memory replay view.
+
+FTS5 search tables are intentionally not part of this schema yet. Selector
+search remains the existing in-memory, case-insensitive all-term substring
+match.
 
 ## Development
 
