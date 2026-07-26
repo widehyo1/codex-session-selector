@@ -228,7 +228,7 @@ Selector options:
       --replay-command COMMAND   Optional external replay override
                                  default: internal replay
       --no-refresh               Do not rebuild the SQLite index before opening
-      --include-exec             Index and show command execution records
+      --include-exec             Index exec records and initially show them
       --print-path               Print the selected JSONL path instead of replaying
   -h, --help                     Show this help
   -V, --version                  Show version
@@ -238,6 +238,7 @@ Keys:
   /                              interactive search
   Tab                            switch pane focus; while searching, cycle scope
   h/l or Left/Right              horizontal scroll in sessions pane
+  e                              toggle exec entries for replay
   y                              copy `codex resume <session-id>` to clipboard
   q, Esc, Ctrl-C                 quit",
         version = env!("CARGO_PKG_VERSION")
@@ -286,8 +287,8 @@ Usage:
   select-codex-session replay [REPLAY_OPTIONS] [PATH|-]
 
 Options:
-      --include-exec     Show command execution records in the timeline
-                         default: hidden
+      --include-exec     Initially show command execution records
+                         default: hidden; press e to toggle
   -h, --help             Show this help
   -V, --version          Show version
 
@@ -302,6 +303,7 @@ Keys:
   d/u or Page keys   page move or page scroll
   g/G                first/last event or detail top/bottom
   1/2/f              fullscreen controls
+  e                  toggle command execution entries
   y                  copy detail pane to clipboard
   q, Esc, Ctrl-C     quit",
         version = env!("CARGO_PKG_VERSION")
@@ -423,12 +425,21 @@ mod tests {
     }
 
     #[test]
-    fn help_texts_match_the_integrated_cli_surface() {
+    fn help_texts_describe_initial_visibility_and_toggle_key() {
         let root = help_text(HelpTopic::Root);
         assert!(root.contains("select-codex-session index"));
         assert!(root.contains("select-codex-session replay"));
+        assert!(root.contains("Index exec records and initially show them"));
+        assert!(root.contains("e                              toggle exec entries for replay"));
         assert!(!root.ends_with('\n'));
-        assert!(help_text(HelpTopic::Index).contains("--include-empty-messages"));
-        assert!(help_text(HelpTopic::Replay).contains("[PATH|-]"));
+
+        let index = help_text(HelpTopic::Index);
+        assert!(index.contains("--include-empty-messages"));
+        assert!(index.contains("Also create and populate exec_events"));
+
+        let replay = help_text(HelpTopic::Replay);
+        assert!(replay.contains("[PATH|-]"));
+        assert!(replay.contains("default: hidden; press e to toggle"));
+        assert!(replay.contains("e                  toggle command execution entries"));
     }
 }

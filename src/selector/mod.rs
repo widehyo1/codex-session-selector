@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -10,7 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::{SessionRow, session_date, terminal};
+use crate::{SessionRow, session_date, terminal, ui_state::ExecVisibility};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -51,14 +51,17 @@ pub(crate) struct SelectorApp {
     metadata_scroll: usize,
     message_scroll: u16,
     show_help: bool,
+    exec_visibility: ExecVisibility,
     status: Option<String>,
 }
 
 impl SelectorApp {
-    pub(crate) fn new(rows: Vec<SessionRow>) -> Self {
+    pub(crate) fn new(rows: Vec<SessionRow>, exec_visibility: ExecVisibility) -> Self {
         let filtered = rows.clone();
         let mut list_state = ListState::default();
-        list_state.select(Some(0));
+        if !filtered.is_empty() {
+            list_state.select(Some(0));
+        }
 
         Self {
             rows,
@@ -71,6 +74,7 @@ impl SelectorApp {
             metadata_scroll: 0,
             message_scroll: 0,
             show_help: false,
+            exec_visibility,
             status: None,
         }
     }
@@ -160,6 +164,19 @@ impl SelectorApp {
         }
     }
 
+    pub(crate) fn exec_visibility(&self) -> ExecVisibility {
+        self.exec_visibility
+    }
+
+    pub(crate) fn set_exec_visibility(&mut self, visibility: ExecVisibility) {
+        self.exec_visibility = visibility;
+    }
+
+    fn toggle_exec_visibility(&mut self) {
+        self.exec_visibility.toggle();
+        self.status = None;
+    }
+
     fn move_next(&mut self) {
         if self.filtered.is_empty() {
             return;
@@ -217,6 +234,119 @@ impl SelectorApp {
     pub(crate) fn set_status(&mut self, status: impl Into<String>) {
         self.status = Some(status.into());
     }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Option<SelectorAction> {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Some(SelectorAction::Quit);
+        }
+
+        if self.show_help {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => self.show_help = false,
+                KeyCode::Char('q') => return Some(SelectorAction::Quit),
+                _ => {}
+            }
+            return None;
+        }
+
+        match self.mode {
+            Mode::Normal => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => Some(SelectorAction::Quit),
+                KeyCode::Enter => self.selected_path().map(SelectorAction::OpenReplay),
+                KeyCode::Char('e') if key.modifiers.is_empty() => {
+                    self.toggle_exec_visibility();
+                    None
+                }
+                KeyCode::Char('/') => {
+                    self.mode = Mode::Search;
+                    None
+                }
+                KeyCode::Char('?') => {
+                    self.show_help = true;
+                    None
+                }
+                KeyCode::Char('y') => {
+                    self.copy_resume_command_to_clipboard();
+                    None
+                }
+                KeyCode::Tab => {
+                    self.toggle_focus();
+                    None
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    match self.focus {
+                        PaneFocus::Sessions => self.move_next(),
+                        PaneFocus::Message => self.message_line_down(),
+                    }
+                    None
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    match self.focus {
+                        PaneFocus::Sessions => self.move_previous(),
+                        PaneFocus::Message => self.message_line_up(),
+                    }
+                    None
+                }
+                KeyCode::Char('d') | KeyCode::PageDown => {
+                    match self.focus {
+                        PaneFocus::Sessions => self.page_down(10),
+                        PaneFocus::Message => self.message_page_down(),
+                    }
+                    None
+                }
+                KeyCode::Char('u') | KeyCode::PageUp => {
+                    match self.focus {
+                        PaneFocus::Sessions => self.page_up(10),
+                        PaneFocus::Message => self.message_page_up(),
+                    }
+                    None
+                }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    match self.focus {
+                        PaneFocus::Sessions => self.move_first(),
+                        PaneFocus::Message => self.message_scroll = 0,
+                    }
+                    None
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    match self.focus {
+                        PaneFocus::Sessions => self.move_last(),
+                        PaneFocus::Message => self.message_scroll = u16::MAX,
+                    }
+                    None
+                }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    self.metadata_scroll_left();
+                    None
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    self.metadata_scroll_right();
+                    None
+                }
+                KeyCode::Char('0') => {
+                    self.metadata_scroll_home();
+                    None
+                }
+                _ => None,
+            },
+            Mode::Search => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Normal,
+                    KeyCode::Tab => self.next_search_scope(),
+                    KeyCode::Backspace => {
+                        self.query.pop();
+                        self.refresh_filter();
+                    }
+                    KeyCode::Char(ch) => {
+                        self.query.push(ch);
+                        self.refresh_filter();
+                    }
+                    _ => {}
+                }
+                None
+            }
+        }
+    }
 }
 
 pub(crate) fn run(app: &mut SelectorApp) -> Result<SelectorAction> {
@@ -236,67 +366,8 @@ fn run_event_loop(
                     continue;
                 }
 
-                match app.mode {
-                    Mode::Normal => match key.code {
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(SelectorAction::Quit);
-                        }
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(SelectorAction::Quit),
-                        KeyCode::Enter => {
-                            if let Some(path) = app.selected_path() {
-                                return Ok(SelectorAction::OpenReplay(path));
-                            }
-                        }
-                        KeyCode::Char('/') => app.mode = Mode::Search,
-                        KeyCode::Char('?') => app.show_help = !app.show_help,
-                        KeyCode::Char('y') => app.copy_resume_command_to_clipboard(),
-                        KeyCode::Tab => app.toggle_focus(),
-                        KeyCode::Char('j') | KeyCode::Down => match app.focus {
-                            PaneFocus::Sessions => app.move_next(),
-                            PaneFocus::Message => app.message_line_down(),
-                        },
-                        KeyCode::Char('k') | KeyCode::Up => match app.focus {
-                            PaneFocus::Sessions => app.move_previous(),
-                            PaneFocus::Message => app.message_line_up(),
-                        },
-                        KeyCode::Char('d') | KeyCode::PageDown => match app.focus {
-                            PaneFocus::Sessions => app.page_down(10),
-                            PaneFocus::Message => app.message_page_down(),
-                        },
-                        KeyCode::Char('u') | KeyCode::PageUp => match app.focus {
-                            PaneFocus::Sessions => app.page_up(10),
-                            PaneFocus::Message => app.message_page_up(),
-                        },
-                        KeyCode::Char('g') | KeyCode::Home => match app.focus {
-                            PaneFocus::Sessions => app.move_first(),
-                            PaneFocus::Message => app.message_scroll = 0,
-                        },
-                        KeyCode::Char('G') | KeyCode::End => match app.focus {
-                            PaneFocus::Sessions => app.move_last(),
-                            PaneFocus::Message => app.message_scroll = u16::MAX,
-                        },
-                        KeyCode::Char('h') | KeyCode::Left => app.metadata_scroll_left(),
-                        KeyCode::Char('l') | KeyCode::Right => app.metadata_scroll_right(),
-                        KeyCode::Char('0') => app.metadata_scroll_home(),
-                        _ => {}
-                    },
-                    Mode::Search => match key.code {
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(SelectorAction::Quit);
-                        }
-                        KeyCode::Esc => app.mode = Mode::Normal,
-                        KeyCode::Enter => app.mode = Mode::Normal,
-                        KeyCode::Tab => app.next_search_scope(),
-                        KeyCode::Backspace => {
-                            app.query.pop();
-                            app.refresh_filter();
-                        }
-                        KeyCode::Char(ch) => {
-                            app.query.push(ch);
-                            app.refresh_filter();
-                        }
-                        _ => {}
-                    },
+                if let Some(action) = app.handle_key(key) {
+                    return Ok(action);
                 }
             }
         }
@@ -333,7 +404,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &SelectorApp) {
     let selected = app
         .selected_index()
         .map(|index| format!("{}/{}", index + 1, app.filtered.len()))
-        .unwrap_or_else(|| format!("0/{}", app.filtered.len()));
+        .unwrap_or_else(|| "0/0".to_string());
 
     let query = if app.query.is_empty() {
         String::new()
@@ -347,7 +418,11 @@ fn render_header(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::styled(selected, Style::default().fg(Color::Cyan)),
-        Span::raw(format!(" of {}{query}", app.rows.len())),
+        Span::raw(format!(
+            " of {}{query} | exec: {}",
+            app.rows.len(),
+            app.exec_visibility.label()
+        )),
     ]);
 
     frame.render_widget(header, area);
@@ -450,6 +525,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             Span::raw(" Tab focus "),
             Span::raw(" / search "),
             Span::raw(" Enter replay "),
+            Span::raw(" e exec "),
             Span::raw(" y copy-resume "),
             Span::raw(" q quit "),
             Span::raw(" Ctrl-C quit "),
@@ -503,6 +579,7 @@ fn render_help(frame: &mut Frame) {
         Line::raw("Other"),
         Line::raw("  Enter           replay the selected jsonl path"),
         Line::raw("                  return from replay to this selector when replay exits"),
+        Line::raw("  e               toggle exec entries for the next replay"),
         Line::raw("  y               copy `codex resume <session-id>` to clipboard"),
         Line::raw("  ?               toggle help"),
         Line::raw("  q / Ctrl-C      quit"),
@@ -678,6 +755,11 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
 
     fn sample_rows() -> Vec<SessionRow> {
         vec![
@@ -800,5 +882,94 @@ mod tests {
 
         rows[0].id = None;
         assert_eq!(resume_command(&rows[0]), None);
+    }
+
+    #[test]
+    fn selector_initial_visibility_matches_cli_state() {
+        let rows = sample_rows();
+        let hidden = SelectorApp::new(rows.clone(), ExecVisibility::Hidden);
+        let shown = SelectorApp::new(rows.clone(), ExecVisibility::Shown);
+
+        assert_eq!(hidden.exec_visibility(), ExecVisibility::Hidden);
+        assert_eq!(shown.exec_visibility(), ExecVisibility::Shown);
+        assert_eq!(hidden.filtered.len(), rows.len());
+        assert_eq!(shown.filtered.len(), rows.len());
+    }
+
+    #[test]
+    fn selector_e_toggles_only_in_normal_mode() {
+        let mut app = SelectorApp::new(sample_rows(), ExecVisibility::Hidden);
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('e'))), None);
+        assert_eq!(app.exec_visibility(), ExecVisibility::Shown);
+
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(app.exec_visibility(), ExecVisibility::Shown);
+        assert_eq!(app.query, "e");
+
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(app.exec_visibility(), ExecVisibility::Shown);
+    }
+
+    #[test]
+    fn selector_help_is_modal_for_exec_toggle() {
+        let mut app = SelectorApp::new(sample_rows(), ExecVisibility::Hidden);
+        let selected = app.selected_index();
+        let focus = app.focus;
+
+        app.handle_key(key(KeyCode::Char('?')));
+        assert!(app.show_help);
+        for code in [KeyCode::Char('e'), KeyCode::Char('j'), KeyCode::Tab] {
+            assert_eq!(app.handle_key(key(code)), None);
+        }
+        assert_eq!(app.exec_visibility(), ExecVisibility::Hidden);
+        assert_eq!(app.selected_index(), selected);
+        assert_eq!(app.focus, focus);
+
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), None);
+        assert!(!app.show_help);
+    }
+
+    #[test]
+    fn selector_toggle_preserves_existing_state() {
+        let mut app = SelectorApp::new(sample_rows(), ExecVisibility::Hidden);
+        app.list_state.select(Some(1));
+        app.query = "selector".to_string();
+        app.search_scope = SearchScope::Branch;
+        app.focus = PaneFocus::Message;
+        app.metadata_scroll = 8;
+        app.message_scroll = 5;
+        app.status = Some("transient error".to_string());
+        let rows = app.rows.clone();
+        let filtered = app.filtered.clone();
+
+        app.handle_key(key(KeyCode::Char('e')));
+
+        assert_eq!(app.exec_visibility(), ExecVisibility::Shown);
+        assert_eq!(app.rows, rows);
+        assert_eq!(app.filtered, filtered);
+        assert_eq!(app.selected_index(), Some(1));
+        assert_eq!(app.query, "selector");
+        assert_eq!(app.search_scope, SearchScope::Branch);
+        assert_eq!(app.focus, PaneFocus::Message);
+        assert_eq!(app.metadata_scroll, 8);
+        assert_eq!(app.message_scroll, 5);
+        assert_eq!(app.status, None);
+    }
+
+    #[test]
+    fn selector_toggle_is_safe_with_empty_search_result() {
+        let mut app = SelectorApp::new(sample_rows(), ExecVisibility::Hidden);
+        app.query = "definitely-not-present".to_string();
+        app.refresh_filter();
+        app.mode = Mode::Normal;
+
+        app.handle_key(key(KeyCode::Char('e')));
+
+        assert!(app.filtered.is_empty());
+        assert_eq!(app.selected_index(), None);
+        assert_eq!(app.exec_visibility(), ExecVisibility::Shown);
     }
 }

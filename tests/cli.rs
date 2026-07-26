@@ -5,7 +5,7 @@ fn binary() -> &'static str {
 }
 
 #[test]
-fn root_help_lists_subcommands() {
+fn root_help_lists_exec_toggle_key() {
     let output = Command::new(binary()).arg("--help").output().unwrap();
 
     assert!(output.status.success());
@@ -13,6 +13,7 @@ fn root_help_lists_subcommands() {
     assert!(stdout.contains("index"));
     assert!(stdout.contains("replay"));
     assert!(stdout.contains("--include-exec"));
+    assert!(stdout.contains("toggle exec entries for replay"));
 }
 
 #[test]
@@ -30,7 +31,7 @@ fn index_help_lists_legacy_recorder_options() {
 }
 
 #[test]
-fn replay_help_lists_current_replay_options() {
+fn replay_help_lists_exec_toggle_key() {
     let output = Command::new(binary())
         .args(["replay", "--help"])
         .output()
@@ -40,6 +41,8 @@ fn replay_help_lists_current_replay_options() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("--include-exec"));
     assert!(stdout.contains("[PATH|-]"));
+    assert!(stdout.contains("default: hidden; press e to toggle"));
+    assert!(stdout.contains("toggle command execution entries"));
 }
 
 #[test]

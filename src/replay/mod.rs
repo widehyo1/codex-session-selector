@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io::Read, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
@@ -11,7 +11,7 @@ use ratatui::{
 };
 use serde::Deserialize;
 
-use crate::{cli::ReplayOptions, terminal};
+use crate::{cli::ReplayOptions, terminal, ui_state::ExecVisibility};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
@@ -78,7 +78,7 @@ enum NormalizedEvent {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
     User,
     Agent,
@@ -100,55 +100,110 @@ enum Fullscreen {
 
 #[derive(Debug, Clone)]
 struct Entry {
-    index: usize,
     kind: EntryKind,
-    title: String,
+    summary: String,
     detail: String,
 }
 
 struct ReplayApp {
-    entries: Vec<Entry>,
+    all_entries: Vec<Entry>,
+    visible_indices: Vec<usize>,
     list_state: ListState,
     detail_scroll: u16,
     focus: PaneFocus,
     fullscreen: Fullscreen,
     show_help: bool,
+    exec_visibility: ExecVisibility,
     status: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayControl {
+    Continue,
+    Quit,
+}
+
 impl ReplayApp {
-    fn new(entries: Vec<Entry>) -> Self {
+    fn new(all_entries: Vec<Entry>, exec_visibility: ExecVisibility) -> Self {
+        let visible_indices = visible_entry_indices(&all_entries, exec_visibility);
         let mut list_state = ListState::default();
-        if !entries.is_empty() {
+        if !visible_indices.is_empty() {
             list_state.select(Some(0));
         }
 
         Self {
-            entries,
+            all_entries,
+            visible_indices,
             list_state,
             detail_scroll: 0,
             focus: PaneFocus::Timeline,
             fullscreen: Fullscreen::None,
             show_help: false,
+            exec_visibility,
             status: None,
         }
     }
 
-    fn selected_index(&self) -> Option<usize> {
+    fn selected_visible_index(&self) -> Option<usize> {
         self.list_state.selected()
     }
 
-    fn selected_entry(&self) -> Option<&Entry> {
-        self.selected_index().and_then(|i| self.entries.get(i))
+    fn selected_all_index(&self) -> Option<usize> {
+        self.selected_visible_index()
+            .and_then(|index| self.visible_indices.get(index))
+            .copied()
     }
 
-    fn next(&mut self) {
-        if self.entries.is_empty() {
+    fn selected_entry(&self) -> Option<(usize, &Entry)> {
+        let visible_index = self.selected_visible_index()?;
+        let all_index = *self.visible_indices.get(visible_index)?;
+        self.all_entries
+            .get(all_index)
+            .map(|entry| (visible_index, entry))
+    }
+
+    fn rebuild_visible_indices(&mut self, previous_all_index: Option<usize>) {
+        self.visible_indices = visible_entry_indices(&self.all_entries, self.exec_visibility);
+
+        if self.visible_indices.is_empty() {
+            self.list_state.select(None);
             return;
         }
 
-        let next = match self.selected_index() {
-            Some(i) if i + 1 < self.entries.len() => i + 1,
+        let selected_visible_index = previous_all_index
+            .and_then(|all_index| {
+                self.visible_indices
+                    .iter()
+                    .position(|candidate| *candidate == all_index)
+            })
+            .or_else(|| {
+                previous_all_index.and_then(|all_index| {
+                    self.visible_indices
+                        .iter()
+                        .position(|candidate| *candidate > all_index)
+                })
+            })
+            .or_else(|| previous_all_index.map(|_| self.visible_indices.len() - 1))
+            .unwrap_or(0);
+
+        self.list_state.select(Some(selected_visible_index));
+    }
+
+    fn toggle_exec_visibility(&mut self) {
+        let previous_all_index = self.selected_all_index();
+        self.exec_visibility.toggle();
+        self.rebuild_visible_indices(previous_all_index);
+        self.detail_scroll = 0;
+        self.status = None;
+    }
+
+    fn next(&mut self) {
+        if self.visible_indices.is_empty() {
+            return;
+        }
+
+        let next = match self.selected_visible_index() {
+            Some(i) if i + 1 < self.visible_indices.len() => i + 1,
             _ => 0,
         };
 
@@ -158,12 +213,12 @@ impl ReplayApp {
     }
 
     fn previous(&mut self) {
-        if self.entries.is_empty() {
+        if self.visible_indices.is_empty() {
             return;
         }
 
-        let previous = match self.selected_index() {
-            Some(0) | None => self.entries.len() - 1,
+        let previous = match self.selected_visible_index() {
+            Some(0) | None => self.visible_indices.len() - 1,
             Some(i) => i - 1,
         };
 
@@ -222,9 +277,13 @@ impl ReplayApp {
     }
 
     fn selected_detail_string(&self) -> Option<String> {
-        let entry = self.selected_entry()?;
+        let (visible_index, entry) = self.selected_entry()?;
 
-        Some(format!("{}\n\n{}", entry.title, entry.detail))
+        Some(format!(
+            "{}\n\n{}",
+            display_title(visible_index, entry),
+            entry.detail
+        ))
     }
 
     fn copy_detail_to_clipboard(&mut self) {
@@ -242,13 +301,135 @@ impl ReplayApp {
             }
         }
     }
+
+    fn handle_key(&mut self, key: KeyEvent) -> ReplayControl {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return ReplayControl::Quit;
+        }
+
+        if self.show_help {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => self.show_help = false,
+                KeyCode::Char('q') => return ReplayControl::Quit,
+                _ => {}
+            }
+            return ReplayControl::Continue;
+        }
+
+        match key.code {
+            KeyCode::Char('q') => ReplayControl::Quit,
+            KeyCode::Esc => {
+                if self.fullscreen != Fullscreen::None {
+                    self.exit_fullscreen();
+                    ReplayControl::Continue
+                } else {
+                    ReplayControl::Quit
+                }
+            }
+            KeyCode::Char('e') if key.modifiers.is_empty() => {
+                self.toggle_exec_visibility();
+                ReplayControl::Continue
+            }
+            KeyCode::Tab => {
+                self.toggle_focus();
+                ReplayControl::Continue
+            }
+            KeyCode::Char('1') => {
+                self.toggle_timeline_fullscreen();
+                ReplayControl::Continue
+            }
+            KeyCode::Char('2') => {
+                self.toggle_detail_fullscreen();
+                ReplayControl::Continue
+            }
+            KeyCode::Char('f') => {
+                match self.focus {
+                    PaneFocus::Timeline => self.toggle_timeline_fullscreen(),
+                    PaneFocus::Detail => self.toggle_detail_fullscreen(),
+                }
+                ReplayControl::Continue
+            }
+            KeyCode::Char('y') => {
+                if self.focus == PaneFocus::Detail || self.fullscreen == Fullscreen::Detail {
+                    self.copy_detail_to_clipboard();
+                }
+                ReplayControl::Continue
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                match self.focus {
+                    PaneFocus::Timeline => self.next(),
+                    PaneFocus::Detail => self.detail_line_down(),
+                }
+                ReplayControl::Continue
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                match self.focus {
+                    PaneFocus::Timeline => self.previous(),
+                    PaneFocus::Detail => self.detail_line_up(),
+                }
+                ReplayControl::Continue
+            }
+            KeyCode::Char('d') | KeyCode::PageDown => {
+                match self.focus {
+                    PaneFocus::Timeline => self.next(),
+                    PaneFocus::Detail => self.detail_page_down(),
+                }
+                ReplayControl::Continue
+            }
+            KeyCode::Char('u') | KeyCode::PageUp => {
+                match self.focus {
+                    PaneFocus::Timeline => self.previous(),
+                    PaneFocus::Detail => self.detail_page_up(),
+                }
+                ReplayControl::Continue
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                match self.focus {
+                    PaneFocus::Timeline => {
+                        if !self.visible_indices.is_empty() {
+                            self.list_state.select(Some(0));
+                            self.detail_scroll = 0;
+                        }
+                    }
+                    PaneFocus::Detail => {
+                        self.detail_scroll = 0;
+                    }
+                }
+                self.status = None;
+                ReplayControl::Continue
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                match self.focus {
+                    PaneFocus::Timeline => {
+                        if !self.visible_indices.is_empty() {
+                            self.list_state.select(Some(self.visible_indices.len() - 1));
+                            self.detail_scroll = 0;
+                        }
+                    }
+                    PaneFocus::Detail => {
+                        self.detail_scroll = u16::MAX;
+                    }
+                }
+                self.status = None;
+                ReplayControl::Continue
+            }
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                ReplayControl::Continue
+            }
+            _ => ReplayControl::Continue,
+        }
+    }
 }
 
-pub(crate) fn run(options: &ReplayOptions) -> Result<()> {
+pub(crate) fn run(options: &ReplayOptions) -> Result<ExecVisibility> {
     let input = read_input(options.input.as_deref())?;
-    let entries = load_entries_from_str(&input, options.include_exec)?;
+    let entries = load_entries_from_str(&input)?;
+    let exec_visibility = ExecVisibility::from_include_exec(options.include_exec);
 
-    terminal::with_terminal(|terminal| run_event_loop(terminal, ReplayApp::new(entries)))
+    terminal::with_terminal(|terminal| {
+        run_event_loop(terminal, ReplayApp::new(entries, exec_visibility))
+    })
 }
 
 fn read_input(input: Option<&Path>) -> Result<String> {
@@ -278,7 +459,10 @@ fn read_input_from_reader(reader: &mut impl Read) -> Result<String> {
     Ok(input)
 }
 
-fn run_event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: ReplayApp) -> Result<()> {
+fn run_event_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    mut app: ReplayApp,
+) -> Result<ExecVisibility> {
     loop {
         terminal.draw(|frame| render(frame, &mut app))?;
 
@@ -288,95 +472,15 @@ fn run_event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: ReplayApp) -
                     continue;
                 }
 
-                match key.code {
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                    KeyCode::Char('q') => break,
-
-                    KeyCode::Esc => {
-                        if app.fullscreen != Fullscreen::None {
-                            app.exit_fullscreen();
-                        } else if app.show_help {
-                            app.show_help = false;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    KeyCode::Tab => app.toggle_focus(),
-
-                    KeyCode::Char('1') => app.toggle_timeline_fullscreen(),
-                    KeyCode::Char('2') => app.toggle_detail_fullscreen(),
-                    KeyCode::Char('f') => match app.focus {
-                        PaneFocus::Timeline => app.toggle_timeline_fullscreen(),
-                        PaneFocus::Detail => app.toggle_detail_fullscreen(),
-                    },
-
-                    KeyCode::Char('y') => {
-                        if app.focus == PaneFocus::Detail || app.fullscreen == Fullscreen::Detail {
-                            app.copy_detail_to_clipboard();
-                        }
-                    }
-
-                    KeyCode::Char('j') | KeyCode::Down => match app.focus {
-                        PaneFocus::Timeline => app.next(),
-                        PaneFocus::Detail => app.detail_line_down(),
-                    },
-
-                    KeyCode::Char('k') | KeyCode::Up => match app.focus {
-                        PaneFocus::Timeline => app.previous(),
-                        PaneFocus::Detail => app.detail_line_up(),
-                    },
-
-                    KeyCode::Char('d') | KeyCode::PageDown => match app.focus {
-                        PaneFocus::Timeline => app.next(),
-                        PaneFocus::Detail => app.detail_page_down(),
-                    },
-
-                    KeyCode::Char('u') | KeyCode::PageUp => match app.focus {
-                        PaneFocus::Timeline => app.previous(),
-                        PaneFocus::Detail => app.detail_page_up(),
-                    },
-
-                    KeyCode::Char('g') | KeyCode::Home => {
-                        match app.focus {
-                            PaneFocus::Timeline => {
-                                app.list_state.select(Some(0));
-                                app.detail_scroll = 0;
-                            }
-                            PaneFocus::Detail => {
-                                app.detail_scroll = 0;
-                            }
-                        }
-                        app.status = None;
-                    }
-
-                    KeyCode::Char('G') | KeyCode::End => {
-                        match app.focus {
-                            PaneFocus::Timeline => {
-                                if !app.entries.is_empty() {
-                                    app.list_state.select(Some(app.entries.len() - 1));
-                                    app.detail_scroll = 0;
-                                }
-                            }
-                            PaneFocus::Detail => {
-                                app.detail_scroll = u16::MAX;
-                            }
-                        }
-                        app.status = None;
-                    }
-
-                    KeyCode::Char('?') => app.show_help = !app.show_help,
-
-                    _ => {}
+                if app.handle_key(key) == ReplayControl::Quit {
+                    return Ok(app.exec_visibility);
                 }
             }
         }
     }
-
-    Ok(())
 }
 
-fn load_entries_from_str(input: &str, include_exec: bool) -> Result<Vec<Entry>> {
+fn load_entries_from_str(input: &str) -> Result<Vec<Entry>> {
     let trimmed = input.trim();
 
     if trimmed.is_empty() {
@@ -394,11 +498,7 @@ fn load_entries_from_str(input: &str, include_exec: bool) -> Result<Vec<Entry>> 
 
         match event {
             NormalizedEvent::Payload(event) => {
-                if !include_exec && matches!(event, PayloadEvent::ExecCommandEnd { .. }) {
-                    continue;
-                }
-                let index = entries.len();
-                entries.push(to_entry(index, event));
+                entries.push(to_entry(event));
             }
             NormalizedEvent::ExecToolCall {
                 call_id,
@@ -406,11 +506,8 @@ fn load_entries_from_str(input: &str, include_exec: bool) -> Result<Vec<Entry>> 
                 name,
                 input,
             } => {
-                if !include_exec {
-                    continue;
-                }
                 let index = entries.len();
-                let entry = to_exec_tool_entry(index, call_id.clone(), &kind, &name, &input);
+                let entry = to_exec_tool_entry(call_id.clone(), &kind, &name, &input);
                 entries.push(entry);
                 if let Some(call_id) = call_id {
                     exec_by_call_id.insert(call_id, index);
@@ -429,6 +526,17 @@ fn load_entries_from_str(input: &str, include_exec: bool) -> Result<Vec<Entry>> 
     }
 
     Ok(entries)
+}
+
+fn visible_entry_indices(entries: &[Entry], visibility: ExecVisibility) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(all_index, entry)| {
+            let visible = visibility.is_shown() || !matches!(entry.kind, EntryKind::Exec);
+            visible.then_some(all_index)
+        })
+        .collect()
 }
 
 fn parse_json_values(input: &str) -> Result<Vec<serde_json::Value>> {
@@ -536,19 +644,17 @@ fn exec_tool_input(payload: &serde_json::Value) -> String {
     }
 }
 
-fn to_entry(index: usize, event: PayloadEvent) -> Entry {
+fn to_entry(event: PayloadEvent) -> Entry {
     match event {
         PayloadEvent::UserMessage { message, phase } => Entry {
-            index,
             kind: EntryKind::User,
-            title: format!("#{index:04} USER{}", phase_suffix(phase.as_deref())),
+            summary: format!("USER{}", phase_suffix(phase.as_deref())),
             detail: message,
         },
 
         PayloadEvent::AgentMessage { message, phase } => Entry {
-            index,
             kind: EntryKind::Agent,
-            title: format!("#{index:04} AGENT{}", phase_suffix(phase.as_deref())),
+            summary: format!("AGENT{}", phase_suffix(phase.as_deref())),
             detail: message,
         },
 
@@ -579,22 +685,15 @@ fn to_entry(index: usize, event: PayloadEvent) -> Entry {
             detail.push_str(&aggregated_output);
 
             Entry {
-                index,
                 kind: EntryKind::Exec,
-                title: format!("#{index:04} EXEC {command_summary}"),
+                summary: format!("EXEC {command_summary}"),
                 detail,
             }
         }
     }
 }
 
-fn to_exec_tool_entry(
-    index: usize,
-    call_id: Option<String>,
-    kind: &str,
-    name: &str,
-    input: &str,
-) -> Entry {
+fn to_exec_tool_entry(call_id: Option<String>, kind: &str, name: &str, input: &str) -> Entry {
     let command = extract_exec_command(input).unwrap_or_else(|| input.to_string());
     let command_summary = truncate(&command.replace('\n', " "), 80);
     let mut detail = String::new();
@@ -623,11 +722,14 @@ fn to_exec_tool_entry(
     detail.push_str("------\n");
 
     Entry {
-        index,
         kind: EntryKind::Exec,
-        title: format!("#{index:04} EXEC {command_summary}"),
+        summary: format!("EXEC {command_summary}"),
         detail,
     }
+}
+
+fn display_title(visible_index: usize, entry: &Entry) -> String {
+    format!("#{visible_index:04} {}", entry.summary)
 }
 
 fn append_exec_output(entry: &mut Entry, output: &str) {
@@ -812,8 +914,8 @@ fn render(frame: &mut Frame, app: &mut ReplayApp) {
 
 fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp) {
     let selected = app
-        .selected_index()
-        .map(|i| format!("{}/{}", i + 1, app.entries.len()))
+        .selected_visible_index()
+        .map(|i| format!("{}/{}", i + 1, app.visible_indices.len()))
         .unwrap_or_else(|| "0/0".to_string());
 
     let header = Line::from(vec![
@@ -821,8 +923,12 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp
             " Codex Replay ",
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" "),
         Span::styled(selected, Style::default().fg(Color::Cyan)),
+        Span::raw(format!(
+            " of {} | exec: {}",
+            app.all_entries.len(),
+            app.exec_visibility.label()
+        )),
     ]);
 
     frame.render_widget(header, area);
@@ -830,20 +936,22 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp
 
 fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut ReplayApp) {
     let items: Vec<ListItem> = app
-        .entries
+        .visible_indices
         .iter()
-        .map(|entry| {
+        .enumerate()
+        .filter_map(|(visible_index, all_index)| {
+            let entry = app.all_entries.get(*all_index)?;
             let style = match entry.kind {
                 EntryKind::User => Style::default().fg(Color::Green),
                 EntryKind::Agent => Style::default().fg(Color::Blue),
                 EntryKind::Exec => Style::default().fg(Color::Yellow),
             };
 
-            ListItem::new(Line::from(vec![
+            Some(ListItem::new(Line::from(vec![
                 Span::styled(kind_label(&entry.kind), style.add_modifier(Modifier::BOLD)),
                 Span::raw(" "),
-                Span::raw(truncate(&entry.title, 120)),
-            ]))
+                Span::raw(truncate(&display_title(visible_index, entry), 120)),
+            ])))
         })
         .collect();
 
@@ -879,7 +987,7 @@ fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut ReplayA
 }
 
 fn render_detail(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp) {
-    let Some(entry) = app.selected_entry() else {
+    let Some((visible_index, entry)) = app.selected_entry() else {
         let empty = Paragraph::new("No entries")
             .block(Block::new().title(" Detail ").borders(Borders::ALL));
         frame.render_widget(empty, area);
@@ -901,8 +1009,11 @@ fn render_detail(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp
         ""
     };
 
-    let title = format!(" Detail{focus_suffix}{fullscreen_suffix}: {} ", entry.title);
-    let text = detail_text(entry);
+    let title = format!(
+        " Detail{focus_suffix}{fullscreen_suffix}: {} ",
+        display_title(visible_index, entry)
+    );
+    let text = detail_text(entry, visible_index);
 
     let paragraph = Paragraph::new(text)
         .block(
@@ -917,12 +1028,12 @@ fn render_detail(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp
     frame.render_widget(paragraph, area);
 }
 
-fn detail_text(entry: &Entry) -> Text<'static> {
+fn detail_text(entry: &Entry, visible_index: usize) -> Text<'static> {
     let mut lines = Vec::new();
 
     lines.push(Line::from(vec![
         Span::styled("index: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(entry.index.to_string()),
+        Span::raw(visible_index.to_string()),
     ]));
 
     lines.push(Line::from(vec![
@@ -970,6 +1081,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp
         Span::raw(" | Tab focus "),
         Span::raw(" 1/2 fullscreen "),
         Span::raw(" f fullscreen-focus "),
+        Span::raw(" e exec "),
         Span::raw(" y copy-detail "),
         Span::raw(" q quit "),
         Span::raw(" ? help "),
@@ -1015,6 +1127,7 @@ fn render_help(frame: &mut Frame) {
         Line::raw("  Esc             leave fullscreen/help or quit"),
         Line::raw(""),
         Line::raw("Other"),
+        Line::raw("  e               toggle command execution entries"),
         Line::raw("  ?               toggle help"),
         Line::raw("  q / Ctrl-C      quit"),
     ])
@@ -1052,34 +1165,66 @@ fn centered_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn common_fixture() -> &'static str {
+        r#"{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}
+{"type":"event_msg","payload":{"type":"exec_command_end","parsed_cmd":[{"cmd":"pwd"}],"aggregated_output":"/tmp"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"done"}}
+{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-1","name":"exec","input":"{\"cmd\":\"git status\"}"}}
+{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-1","output":"clean"}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"unmatched","output":"not exec"}}"#
+    }
 
     #[test]
-    fn loads_raw_codex_jsonl_events() {
+    fn loads_all_supported_entries_regardless_of_initial_visibility() {
         let input = r#"{"type":"session_meta","payload":{"id":"ignored"}}
 {"type":"event_msg","payload":{"type":"user_message","message":"hello","phase":"input"}}
 {"type":"event_msg","payload":{"type":"agent_message","message":"world"}}
 {"type":"event_msg","payload":{"type":"exec_command_end","parsed_cmd":[{"type":"exec","cmd":"ls -la","name":"list"}],"aggregated_output":"done"}}"#;
 
-        let entries = load_entries_from_str(input, true).expect("jsonl should parse");
+        let entries = load_entries_from_str(input).expect("jsonl should parse");
 
         assert_eq!(entries.len(), 3);
-        assert!(matches!(entries[0].kind, EntryKind::User));
-        assert_eq!(entries[0].title, "#0000 USER [input]");
+        assert_eq!(entries[0].kind, EntryKind::User);
+        assert_eq!(entries[0].summary, "USER [input]");
         assert_eq!(entries[0].detail, "hello");
-        assert!(matches!(entries[1].kind, EntryKind::Agent));
-        assert!(matches!(entries[2].kind, EntryKind::Exec));
+        assert_eq!(entries[1].kind, EntryKind::Agent);
+        assert_eq!(entries[2].kind, EntryKind::Exec);
         assert!(entries[2].detail.contains("$ ls -la"));
         assert!(entries[2].detail.contains("done"));
+
+        let entries = load_entries_from_str(common_fixture()).expect("fixture should parse");
+        assert_eq!(entries.len(), 4);
+        assert_eq!(
+            entries.iter().map(|entry| entry.kind).collect::<Vec<_>>(),
+            vec![
+                EntryKind::User,
+                EntryKind::Exec,
+                EntryKind::Agent,
+                EntryKind::Exec
+            ]
+        );
+        assert!(entries[3].detail.contains("clean"));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.detail.contains("not exec"))
+        );
     }
 
     #[test]
     fn loads_preprocessed_json_array_events() {
         let input = r#"[{"type":"user_message","message":"array input"}]"#;
 
-        let entries = load_entries_from_str(input, false).expect("json array should parse");
+        let entries = load_entries_from_str(input).expect("json array should parse");
 
         assert_eq!(entries.len(), 1);
-        assert!(matches!(entries[0].kind, EntryKind::User));
+        assert_eq!(entries[0].kind, EntryKind::User);
         assert_eq!(entries[0].detail, "array input");
     }
 
@@ -1090,13 +1235,13 @@ mod tests {
 {"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-1","output":[{"type":"input_text","text":"Script completed\nOutput:\n"},{"type":"input_text","text":"/repo/demo\nfile.txt\n"}]}}
 {"type":"response_item","payload":{"type":"function_call_output","call_id":"unmatched","output":"not exec"}}"#;
 
-        let entries = load_entries_from_str(input, true).expect("jsonl should parse");
+        let entries = load_entries_from_str(input).expect("jsonl should parse");
 
         assert_eq!(entries.len(), 2);
-        assert!(matches!(entries[0].kind, EntryKind::User));
+        assert_eq!(entries[0].kind, EntryKind::User);
         assert_eq!(entries[0].detail, "ignored by replay parser");
-        assert!(matches!(entries[1].kind, EntryKind::Exec));
-        assert_eq!(entries[1].title, "#0001 EXEC pwd && ls");
+        assert_eq!(entries[1].kind, EntryKind::Exec);
+        assert_eq!(entries[1].summary, "EXEC pwd && ls");
         assert!(entries[1].detail.contains("$ pwd && ls"));
         assert!(entries[1].detail.contains("RAW INPUT"));
         assert!(entries[1].detail.contains("Script completed"));
@@ -1109,11 +1254,11 @@ mod tests {
         let input = r#"{"type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"exec_command","arguments":"{\"cmd\":\"git status --short\",\"workdir\":\"/repo/demo\"}"}}
 {"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":" M README.md"}}"#;
 
-        let entries = load_entries_from_str(input, true).expect("jsonl should parse");
+        let entries = load_entries_from_str(input).expect("jsonl should parse");
 
         assert_eq!(entries.len(), 1);
-        assert!(matches!(entries[0].kind, EntryKind::Exec));
-        assert_eq!(entries[0].title, "#0000 EXEC git status --short");
+        assert_eq!(entries[0].kind, EntryKind::Exec);
+        assert_eq!(entries[0].summary, "EXEC git status --short");
         assert!(
             entries[0]
                 .detail
@@ -1139,14 +1284,179 @@ mod tests {
     }
 
     #[test]
-    fn excludes_exec_entries_unless_requested() {
-        let input = r#"{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}
-{"type":"event_msg","payload":{"type":"exec_command_end","parsed_cmd":[{"cmd":"pwd"}],"aggregated_output":"/tmp"}}"#;
+    fn initial_visibility_filters_without_dropping_entries() {
+        let entries = load_entries_from_str(common_fixture()).unwrap();
+        let hidden = ReplayApp::new(entries.clone(), ExecVisibility::Hidden);
+        let shown = ReplayApp::new(entries, ExecVisibility::Shown);
 
-        let entries = load_entries_from_str(input, false).expect("jsonl should parse");
+        assert_eq!(hidden.all_entries.len(), 4);
+        assert_eq!(hidden.visible_indices, vec![0, 2]);
+        assert_eq!(shown.all_entries.len(), 4);
+        assert_eq!(shown.visible_indices, vec![0, 1, 2, 3]);
+    }
 
-        assert_eq!(entries.len(), 1);
-        assert!(matches!(entries[0].kind, EntryKind::User));
+    #[test]
+    fn toggle_preserves_selected_non_exec_entry() {
+        let entries = load_entries_from_str(common_fixture()).unwrap();
+        let mut app = ReplayApp::new(entries, ExecVisibility::Hidden);
+        app.list_state.select(Some(1));
+
+        app.toggle_exec_visibility();
+        assert_eq!(app.selected_all_index(), Some(2));
+        assert_eq!(app.selected_visible_index(), Some(2));
+
+        app.toggle_exec_visibility();
+        assert_eq!(app.selected_all_index(), Some(2));
+        assert_eq!(app.selected_visible_index(), Some(1));
+    }
+
+    #[test]
+    fn hiding_selected_exec_prefers_next_then_previous() {
+        let entries = load_entries_from_str(common_fixture()).unwrap();
+        let mut app = ReplayApp::new(entries, ExecVisibility::Shown);
+        app.list_state.select(Some(1));
+
+        app.toggle_exec_visibility();
+        assert_eq!(app.selected_all_index(), Some(2));
+
+        let entries = vec![
+            Entry {
+                kind: EntryKind::User,
+                summary: "USER".to_string(),
+                detail: "hello".to_string(),
+            },
+            Entry {
+                kind: EntryKind::Exec,
+                summary: "EXEC pwd".to_string(),
+                detail: "/tmp".to_string(),
+            },
+        ];
+        let mut app = ReplayApp::new(entries, ExecVisibility::Shown);
+        app.list_state.select(Some(1));
+
+        app.toggle_exec_visibility();
+        assert_eq!(app.selected_all_index(), Some(0));
+    }
+
+    #[test]
+    fn only_exec_entries_transition_through_empty_selection() {
+        let entries = vec![Entry {
+            kind: EntryKind::Exec,
+            summary: "EXEC pwd".to_string(),
+            detail: "/tmp".to_string(),
+        }];
+        let mut app = ReplayApp::new(entries, ExecVisibility::Hidden);
+
+        assert_eq!(app.all_entries.len(), 1);
+        assert!(app.visible_indices.is_empty());
+        assert_eq!(app.selected_visible_index(), None);
+
+        app.toggle_exec_visibility();
+        assert_eq!(app.visible_indices, vec![0]);
+        assert_eq!(app.selected_visible_index(), Some(0));
+
+        app.toggle_exec_visibility();
+        assert!(app.visible_indices.is_empty());
+        assert_eq!(app.selected_visible_index(), None);
+    }
+
+    #[test]
+    fn display_titles_remain_dense_for_each_visibility() {
+        let entries = load_entries_from_str(common_fixture()).unwrap();
+        let hidden = ReplayApp::new(entries.clone(), ExecVisibility::Hidden);
+        let shown = ReplayApp::new(entries, ExecVisibility::Shown);
+
+        let hidden_titles = hidden
+            .visible_indices
+            .iter()
+            .enumerate()
+            .map(|(visible_index, all_index)| {
+                display_title(visible_index, &hidden.all_entries[*all_index])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(hidden_titles, vec!["#0000 USER", "#0001 AGENT"]);
+
+        let shown_titles = shown
+            .visible_indices
+            .iter()
+            .enumerate()
+            .map(|(visible_index, all_index)| {
+                display_title(visible_index, &shown.all_entries[*all_index])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown_titles,
+            vec![
+                "#0000 USER",
+                "#0001 EXEC pwd",
+                "#0002 AGENT",
+                "#0003 EXEC git status"
+            ]
+        );
+
+        assert_eq!(
+            detail_text(&hidden.all_entries[2], 1).lines[0].spans[1].content,
+            "1"
+        );
+        assert_eq!(
+            detail_text(&shown.all_entries[2], 2).lines[0].spans[1].content,
+            "2"
+        );
+    }
+
+    #[test]
+    fn replay_help_is_modal_and_fullscreen_allows_toggle() {
+        let entries = load_entries_from_str(common_fixture()).unwrap();
+        let mut app = ReplayApp::new(entries, ExecVisibility::Shown);
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('?'))),
+            ReplayControl::Continue
+        );
+        assert!(app.show_help);
+        for code in [KeyCode::Char('e'), KeyCode::Char('1'), KeyCode::Tab] {
+            assert_eq!(app.handle_key(key(code)), ReplayControl::Continue);
+        }
+        assert_eq!(app.exec_visibility, ExecVisibility::Shown);
+        assert_eq!(app.fullscreen, Fullscreen::None);
+        assert_eq!(app.focus, PaneFocus::Timeline);
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.show_help);
+        app.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(app.fullscreen, Fullscreen::Timeline);
+        app.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(app.exec_visibility, ExecVisibility::Hidden);
+        assert_eq!(app.fullscreen, Fullscreen::Timeline);
+    }
+
+    #[test]
+    fn repeated_toggle_reuses_all_entries() {
+        let entries = (0..10_000)
+            .map(|index| Entry {
+                kind: if index % 2 == 0 {
+                    EntryKind::User
+                } else {
+                    EntryKind::Exec
+                },
+                summary: format!("entry {index}"),
+                detail: String::new(),
+            })
+            .collect();
+        let mut app = ReplayApp::new(entries, ExecVisibility::Hidden);
+
+        for _ in 0..100 {
+            app.toggle_exec_visibility();
+            assert_eq!(app.all_entries.len(), 10_000);
+        }
+
+        assert_eq!(app.exec_visibility, ExecVisibility::Hidden);
+        assert_eq!(app.visible_indices.len(), 5_000);
+    }
+
+    #[test]
+    fn invalid_json_error_is_independent_of_visibility() {
+        assert!(load_entries_from_str("{invalid").is_err());
     }
 
     #[test]

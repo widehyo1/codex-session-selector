@@ -9,13 +9,17 @@ use crate::{
     cli::{Command, IndexOptions, ReplayOptions, SelectOptions},
     indexer, load_sessions, replay,
     selector::{self, SelectorAction, SelectorApp},
+    ui_state::ExecVisibility,
 };
 
 pub(crate) fn run(command: Command) -> Result<()> {
     match command {
         Command::Select(options) => run_select(options),
         Command::Index(options) => run_index(options),
-        Command::Replay(options) => replay::run(&options),
+        Command::Replay(options) => {
+            replay::run(&options)?;
+            Ok(())
+        }
     }
 }
 
@@ -35,7 +39,8 @@ fn run_select(options: SelectOptions) -> Result<()> {
         bail!("no sessions found in {}", options.db.display());
     }
 
-    let mut app = SelectorApp::new(rows);
+    let initial_visibility = ExecVisibility::from_include_exec(options.include_exec);
+    let mut app = SelectorApp::new(rows, initial_visibility);
     if options.print_path {
         if let SelectorAction::OpenReplay(path) = selector::run(&mut app)? {
             println!("{}", path.display());
@@ -46,10 +51,16 @@ fn run_select(options: SelectOptions) -> Result<()> {
     loop {
         match selector::run(&mut app)? {
             SelectorAction::Quit => return Ok(()),
-            SelectorAction::OpenReplay(path) => match replay_selected(&options, path) {
-                Ok(()) => app.clear_status(),
-                Err(error) => app.set_status(error.to_string()),
-            },
+            SelectorAction::OpenReplay(path) => {
+                let before_replay = app.exec_visibility();
+                match replay_selected(&options, path, before_replay) {
+                    Ok(after_replay) => {
+                        app.set_exec_visibility(after_replay);
+                        app.clear_status();
+                    }
+                    Err(error) => app.set_status(error.to_string()),
+                }
+            }
         }
     }
 }
@@ -93,32 +104,40 @@ fn run_external_refresh(program: &str, options: &SelectOptions) -> Result<()> {
     Ok(())
 }
 
-fn replay_selected(select_options: &SelectOptions, path: PathBuf) -> Result<()> {
+fn replay_selected(
+    select_options: &SelectOptions,
+    path: PathBuf,
+    exec_visibility: ExecVisibility,
+) -> Result<ExecVisibility> {
     if let Some(program) = select_options.replay_command.as_deref() {
-        return run_external_replay(program, &path, select_options.include_exec);
+        return run_external_replay(program, &path, exec_visibility);
     }
 
     replay::run(&ReplayOptions {
         input: Some(path),
-        include_exec: select_options.include_exec,
+        include_exec: exec_visibility.is_shown(),
     })
 }
 
-fn external_replay_args(path: &Path, include_exec: bool) -> Vec<OsString> {
+fn external_replay_args(path: &Path, exec_visibility: ExecVisibility) -> Vec<OsString> {
     let mut args = Vec::new();
-    if include_exec {
+    if exec_visibility.is_shown() {
         args.push(OsString::from("--include-exec"));
     }
     args.push(path.as_os_str().to_owned());
     args
 }
 
-fn run_external_replay(program: &str, path: &Path, include_exec: bool) -> Result<()> {
+fn run_external_replay(
+    program: &str,
+    path: &Path,
+    exec_visibility: ExecVisibility,
+) -> Result<ExecVisibility> {
     let status = std::process::Command::new(program)
-        .args(external_replay_args(path, include_exec))
+        .args(external_replay_args(path, exec_visibility))
         .status()?;
     if status.success() {
-        return Ok(());
+        return Ok(exec_visibility);
     }
     bail!(
         "{} exited with status {}",
@@ -148,9 +167,13 @@ mod tests {
     }
 
     #[test]
-    fn external_replay_args_match_legacy_contract() {
+    fn external_replay_args_use_current_visibility() {
         assert_eq!(
-            external_replay_args(Path::new("/tmp/session.jsonl"), true),
+            external_replay_args(Path::new("/tmp/session.jsonl"), ExecVisibility::Hidden),
+            vec![OsString::from("/tmp/session.jsonl")]
+        );
+        assert_eq!(
+            external_replay_args(Path::new("/tmp/session.jsonl"), ExecVisibility::Shown),
             vec![
                 OsString::from("--include-exec"),
                 OsString::from("/tmp/session.jsonl"),

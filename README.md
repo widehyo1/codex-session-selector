@@ -54,13 +54,16 @@ Before opening, it rebuilds `~/codex-session-info.sqlite3` from
 `~/.codex/sessions`. Choose a session with `Enter`; when replay exits, the
 selector returns with its selection, query, search scope, and focus intact.
 
-Command-execution records are hidden and not indexed by default. To index and
-show legacy `exec_command_end` records plus newer `exec`/`exec_command` tool
-calls and their matching outputs:
+Command-execution records are hidden and not indexed by default. To index them
+and initially show legacy `exec_command_end` records plus newer
+`exec`/`exec_command` tool calls and their matching outputs:
 
 ```bash
 select-codex-session --include-exec
 ```
+
+The selector and replay headers show `exec: hidden` or `exec: shown`. Press
+`e` at runtime to change replay visibility without rebuilding the index.
 
 ## Selector
 
@@ -99,13 +102,20 @@ An override value is treated as one executable path, not as a shell command.
 - `0`: reset horizontal scroll
 - `/`: interactive search
 - `Tab` while searching: cycle `all`, `message`, `cwd`, `branch`, `repo`, `date`
+- `e`: toggle exec visibility for the next replay
 - `Enter`: replay the selected session, then return to the selector
 - `y`: copy `codex resume <session-id>` to the clipboard
 - `?`: show help
 - `q`, `Esc`, or `Ctrl-C`: quit
 
 Search is case-insensitive substring matching. All whitespace-separated terms
-must match the selected scope.
+must match the selected scope. While searching, `e` is entered as query text
+instead of toggling visibility.
+
+An internal replay returns its final exec visibility to the selector, so the
+next replay starts in the same state. An external `--replay-command` receives
+the visibility that was active when it started, but visibility changes inside
+that separate process are not returned to the selector.
 
 ## Index
 
@@ -158,6 +168,10 @@ jq -c . session.jsonl | select-codex-session replay -
 cat events.json | select-codex-session replay
 ```
 
+Replay parses all supported user, agent, and command-execution entries once.
+The initial state comes from `--include-exec`; pressing `e` then filters the
+in-memory timeline immediately without rereading the JSONL.
+
 ### Replay controls
 
 - `Tab`: switch focus between timeline and detail
@@ -167,6 +181,7 @@ cat events.json | select-codex-session replay
 - `1`: toggle timeline fullscreen
 - `2`: toggle detail fullscreen
 - `f`: toggle the focused pane fullscreen
+- `e`: toggle command-execution entries
 - `y`: copy the detail pane to the clipboard
 - `?`: show help
 - `q`, `Esc`, or `Ctrl-C`: quit
@@ -203,7 +218,11 @@ exec_events(
 
 Indexing recreates `sessions`. Without `--include-exec`, `exec_events` is
 removed; with it, that table is recreated and populated. Replay reads JSONL
-directly rather than using `exec_events`.
+directly rather than using `exec_events`. The TUI `e` toggle only changes the
+in-memory replay view; it does not rebuild SQLite or add/remove tables.
+
+The index still uses a full rebuild. A canonical, incremental index is not part
+of this visibility feature and has not been implemented yet.
 
 ## Development
 
