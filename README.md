@@ -1,101 +1,78 @@
 # Codex Session Selector
 
-Rust TUI utilities for indexing, finding, and replaying local Codex sessions.
+A single Rust TUI executable for indexing, finding, and replaying local Codex
+sessions.
 
 Repository: <https://github.com/widehyo1/codex-session-selector.git>
 
 https://github.com/user-attachments/assets/1885c129-d20a-4def-982f-3eb829745c11
 
-## Binaries
+## Binary
 
-- `record-codex-session-info`: builds a SQLite index from local Codex session JSONL files.
-- `select-codex-session`: searches the index in a TUI and opens the selected session in the replay TUI.
-- `codex-replay-tui`: replays the user, assistant, and optionally command-execution timeline from a session JSONL file.
+The package installs one executable:
+
+- `select-codex-session`: opens the selector by default, builds the SQLite
+  index with the `index` subcommand, and opens session timelines with the
+  `replay` subcommand.
 
 ## Install
 
 Building from source requires Rust 1.85 or newer.
 
-Install all three binaries from crates.io:
-
 ```bash
 cargo install codex-session-selector
 ```
 
-Install from this repository:
+From this repository:
 
 ```bash
 ./install-bundle.sh
 ```
 
-By default, the script installs to `~/.local/bin`. Override the destination with:
+The script installs to `~/.local/bin` by default. Override the destination with
+`CODEX_CLI_BIN_DIR`:
 
 ```bash
 CODEX_CLI_BIN_DIR=~/.cli/bin ./install-bundle.sh
 ```
 
-Install directly from Git with:
+Directly from Git:
 
 ```bash
-cargo install --git https://github.com/widehyo1/codex-session-selector.git --bins
-```
-
-Manual install:
-
-```bash
-cargo build --release
-install -m 755 target/release/record-codex-session-info ~/.local/bin/record-codex-session-info
-install -m 755 target/release/select-codex-session ~/.local/bin/select-codex-session
-install -m 755 target/release/codex-replay-tui ~/.local/bin/codex-replay-tui
+cargo install --git https://github.com/widehyo1/codex-session-selector.git
 ```
 
 ## Quick Start
 
-Open the session selector:
+Open the selector:
 
 ```bash
 select-codex-session
 ```
 
-The selector rebuilds `~/codex-session-info.sqlite3` from
-`~/.codex/sessions` before opening. Choose a session with `Enter`; when replay
-exits, the selector returns with its previous selection and search intact.
+Before opening, it rebuilds `~/codex-session-info.sqlite3` from
+`~/.codex/sessions`. Choose a session with `Enter`; when replay exits, the
+selector returns with its selection, query, search scope, and focus intact.
 
-Command-execution records are hidden and not indexed by default. To index them
-and show them in replay:
+Command-execution records are hidden and not indexed by default. To index and
+show legacy `exec_command_end` records plus newer `exec`/`exec_command` tool
+calls and their matching outputs:
 
 ```bash
 select-codex-session --include-exec
 ```
 
-`--include-exec` is passed both to `record-codex-session-info` during refresh and
-to `codex-replay-tui` after selecting a session. It supports legacy
-`exec_command_end` records as well as `exec`/`exec_command` tool calls and their
-matching outputs in newer JSONL files.
-
 ## Selector
 
-Skip the automatic index refresh:
+Useful options:
 
 ```bash
 select-codex-session --no-refresh
-```
-
-Use a custom index or helper binary:
-
-```bash
 select-codex-session --db /tmp/sessions.sqlite3
-select-codex-session --record-command /path/to/record-codex-session-info
-select-codex-session --replay-command /path/to/codex-replay-tui
-```
-
-Select a session interactively and print its JSONL path instead of replaying it:
-
-```bash
 select-codex-session --print-path
 ```
 
-Available options:
+Selector options:
 
 ```text
 --db PATH
@@ -108,47 +85,47 @@ Available options:
 -V, --version
 ```
 
-### Selector Controls
+`--record-command` and `--replay-command` are advanced compatibility
+overrides. Without them, indexing and replay run inside the same executable.
+An override value is treated as one executable path, not as a shell command.
+
+### Selector controls
 
 - `j/k` or `Up/Down`: move selection
-- `d/u` or `PageDown/PageUp`: page selection or message scroll, depending on focus
-- `g/G`: first/last selection or message top/bottom, depending on focus
+- `d/u` or `PageDown/PageUp`: page selection or message scroll
+- `g/G`: first/last selection or message top/bottom
 - `Tab`: switch focus between sessions and first message
-- `h/l` or `Left/Right`: horizontal scroll in the sessions pane
+- `h/l` or `Left/Right`: horizontally scroll session metadata
 - `0`: reset horizontal scroll
 - `/`: interactive search
-- `Tab` while searching: cycle search scope through `all`, `message`, `cwd`, `branch`, `repo`, `date`
-- `Enter`: run `codex-replay-tui` with the selected JSONL path, then return to the selector after replay exits
+- `Tab` while searching: cycle `all`, `message`, `cwd`, `branch`, `repo`, `date`
+- `Enter`: replay the selected session, then return to the selector
 - `y`: copy `codex resume <session-id>` to the clipboard
-- `?`: help
+- `?`: show help
 - `q`, `Esc`, or `Ctrl-C`: quit
 
-Search terms are matched case-insensitively. Multiple whitespace-separated terms
-must all match the selected scope.
+Search is case-insensitive substring matching. All whitespace-separated terms
+must match the selected scope.
 
-## Recorder
+## Index
 
-Build or replace the default index manually:
-
-```bash
-record-codex-session-info
-```
-
-Use custom paths or include normally filtered sessions:
+Build or replace the default index:
 
 ```bash
-record-codex-session-info --output /tmp/sessions.sqlite3
-record-codex-session-info --sessions-root /path/to/.codex/sessions
-record-codex-session-info --include-subsessions --include-empty-messages
+select-codex-session index
 ```
 
-Add the command-execution index:
+Use custom paths, include normally filtered sessions, or index command
+execution records:
 
 ```bash
-record-codex-session-info --include-exec
+select-codex-session index --output /tmp/sessions.sqlite3
+select-codex-session index --sessions-root /path/to/.codex/sessions
+select-codex-session index --include-subsessions --include-empty-messages
+select-codex-session index --include-exec
 ```
 
-Recorder options:
+Index options:
 
 ```text
 -o, --output PATH
@@ -160,47 +137,54 @@ Recorder options:
 -V, --version
 ```
 
-Subsessions are excluded by default using the `session_meta.payload` structure:
+Subsessions are excluded by default using `session_meta.payload`:
 `source.subagent`, `thread_source == "subagent"`, or a non-empty `agent_role`.
 Sessions without a first user message are also excluded by default.
 
 ## Replay
 
-Replay a session directly:
+Replay a path directly:
 
 ```bash
-codex-replay-tui ~/.codex/sessions/2026/07/26/rollout-....jsonl
-codex-replay-tui --include-exec ~/.codex/sessions/2026/07/26/rollout-....jsonl
+select-codex-session replay ~/.codex/sessions/2026/07/26/rollout-....jsonl
+select-codex-session replay --include-exec ~/.codex/sessions/2026/07/26/rollout-....jsonl
 ```
 
-The replay TUI also accepts raw JSONL or a JSON array on standard input:
+Raw JSONL and JSON arrays are also accepted on standard input. Both `-` and an
+omitted path read stdin:
 
 ```bash
-jq -c . session.jsonl | codex-replay-tui -
+jq -c . session.jsonl | select-codex-session replay -
+cat events.json | select-codex-session replay
 ```
 
-Replay options:
-
-```text
---include-exec
--h, --help
--V, --version
-```
-
-### Replay Controls
+### Replay controls
 
 - `Tab`: switch focus between timeline and detail
-- `j/k` or `Up/Down`: move through events or scroll detail, depending on focus
-- `d/u` or `PageDown/PageUp`: move one event or scroll detail by a page
+- `j/k` or `Up/Down`: move through events or scroll detail
+- `d/u` or `PageDown/PageUp`: move an event or scroll detail by a page
 - `g/G` or `Home/End`: first/last event or detail top/bottom
 - `1`: toggle timeline fullscreen
 - `2`: toggle detail fullscreen
 - `f`: toggle the focused pane fullscreen
 - `y`: copy the detail pane to the clipboard
-- `?`: help
+- `?`: show help
 - `q`, `Esc`, or `Ctrl-C`: quit
 
-## SQLite Schema
+## Migration from 0.2
+
+The standalone executables were replaced by subcommands:
+
+```text
+record-codex-session-info ARGS  → select-codex-session index ARGS
+codex-replay-tui ARGS           → select-codex-session replay ARGS
+```
+
+Upgrading does not automatically delete previously installed standalone
+executables. Remove old copies manually after confirming their install path.
+The existing `~/codex-session-info.sqlite3` remains compatible.
+
+## SQLite schema
 
 The default index contains:
 
@@ -208,7 +192,7 @@ The default index contains:
 sessions(path, id, timestamp, cwd, repository_url, branch, first_message)
 ```
 
-With `record-codex-session-info --include-exec`, it also contains:
+With `select-codex-session index --include-exec`, it also contains:
 
 ```text
 exec_events(
@@ -217,7 +201,23 @@ exec_events(
 )
 ```
 
-Running the recorder recreates the `sessions` table. Without `--include-exec`,
-the `exec_events` table is removed; with it, the table is recreated and
-populated. Replay reads the selected JSONL file directly; `exec_events` is
-available to SQLite queries rather than being used as the replay source.
+Indexing recreates `sessions`. Without `--include-exec`, `exec_events` is
+removed; with it, that table is recreated and populated. Replay reads JSONL
+directly rather than using `exec_events`.
+
+## Development
+
+Enable the tracked pre-commit hook once per clone:
+
+```bash
+scripts/install-git-hooks.sh
+```
+
+The hook and GitHub Actions both call:
+
+```bash
+scripts/check-before-commit.sh
+```
+
+It checks formatting, Clippy with warnings denied, and all targets/features.
+Commits are expected to remain green.

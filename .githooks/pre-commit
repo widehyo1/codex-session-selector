@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$hook_dir/.." && pwd)"
+
+exec "$repo_root/scripts/check-before-commit.sh"

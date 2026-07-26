@@ -9,6 +9,33 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 
+mod application;
+mod cli;
+mod indexer;
+mod replay;
+mod selector;
+mod terminal;
+
+#[cfg(test)]
+mod test_support;
+
+pub fn run_from_args<I>(args: I) -> Result<()>
+where
+    I: IntoIterator<Item = String>,
+{
+    match cli::parse_args(args.into_iter())? {
+        cli::CliAction::Run(command) => application::run(command),
+        cli::CliAction::PrintHelp(topic) => {
+            println!("{}", cli::help_text(topic));
+            Ok(())
+        }
+        cli::CliAction::PrintVersion => {
+            println!("select-codex-session {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRow {
     pub path: PathBuf,
@@ -33,21 +60,11 @@ pub struct ExecEvent {
     pub output: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct CollectOptions {
     pub include_subsessions: bool,
     pub include_empty_messages: bool,
     pub include_exec: bool,
-}
-
-impl Default for CollectOptions {
-    fn default() -> Self {
-        Self {
-            include_subsessions: false,
-            include_empty_messages: false,
-            include_exec: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -609,6 +626,15 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn collect_options_default_disables_all_optional_data() {
+        let options = CollectOptions::default();
+
+        assert!(!options.include_subsessions);
+        assert!(!options.include_empty_messages);
+        assert!(!options.include_exec);
+    }
+
     fn temp_path(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -640,98 +666,6 @@ mod tests {
             }
         });
         fs::write(path, format!("{meta}\n{user}\n")).unwrap();
-    }
-
-    fn write_jsonl_with_exec(path: &Path) {
-        let meta = json!({
-            "type": "session_meta",
-            "payload": {
-                "id": "session-id",
-                "timestamp": "2026-05-28T00:00:00Z",
-                "cwd": "/repo/demo",
-                "source": "cli",
-                "thread_source": "user",
-                "git": {
-                    "repository_url": "https://git.example/demo.git",
-                    "branch": "main"
-                }
-            }
-        });
-        let user = json!({
-            "type": "event_msg",
-            "payload": {
-                "type": "user_message",
-                "message": "real user request"
-            }
-        });
-        let legacy_exec = json!({
-            "type": "event_msg",
-            "payload": {
-                "type": "exec_command_end",
-                "parsed_cmd": [
-                    {
-                        "type": "read",
-                        "cmd": "sed -n '1,80p' README.md",
-                        "name": "README.md"
-                    }
-                ],
-                "aggregated_output": "# Title"
-            }
-        });
-        let tool_call = json!({
-            "type": "response_item",
-            "payload": {
-                "type": "custom_tool_call",
-                "call_id": "call-1",
-                "name": "exec",
-                "input": "const r = await tools.exec_command({\"cmd\":\"pwd\"});",
-                "status": "completed"
-            }
-        });
-        let tool_output = json!({
-            "type": "response_item",
-            "payload": {
-                "type": "custom_tool_call_output",
-                "call_id": "call-1",
-                "output": [
-                    {"type": "input_text", "text": "Script completed"},
-                    {"type": "input_text", "text": "/repo/demo"}
-                ]
-            }
-        });
-        let legacy_tool_call = json!({
-            "type": "response_item",
-            "payload": {
-                "type": "function_call",
-                "call_id": "call-2",
-                "name": "exec_command",
-                "arguments": "{\"cmd\":\"git status --short\",\"workdir\":\"/repo/demo\"}"
-            }
-        });
-        let legacy_tool_output = json!({
-            "type": "response_item",
-            "payload": {
-                "type": "function_call_output",
-                "call_id": "call-2",
-                "output": " M README.md"
-            }
-        });
-        let unmatched_output = json!({
-            "type": "response_item",
-            "payload": {
-                "type": "function_call_output",
-                "call_id": "non-exec-call",
-                "output": "not an exec result"
-            }
-        });
-
-        fs::write(
-            path,
-            format!(
-                "{meta}\n{user}\n{legacy_exec}\n{tool_call}\n{tool_output}\n{legacy_tool_call}\n{legacy_tool_output}\n{unmatched_output}\n"
-            ),
-        )
-        .unwrap();
     }
 
     #[test]
@@ -839,7 +773,7 @@ mod tests {
         let day = root.join("2026").join("05").join("28");
         fs::create_dir_all(&day).unwrap();
         let path = day.join("rollout.jsonl");
-        write_jsonl_with_exec(&path);
+        crate::test_support::write_jsonl_with_exec(&path);
 
         let default_data = collect_session_data(&root, CollectOptions::default()).unwrap();
         assert_eq!(default_data.rows.len(), 1);

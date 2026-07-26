@@ -1,12 +1,7 @@
-use std::{env, io, path::PathBuf, process::Command, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
-use anyhow::{Result, bail};
-use codex_session_selector::{SessionRow, load_sessions, session_date};
-use crossterm::{
-    cursor,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    execute,
-};
+use anyhow::Result;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -15,160 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-fn main() -> Result<()> {
-    let args = Args::parse(env::args().skip(1))?;
-    if args.refresh {
-        refresh_database(&args)?;
-    }
-
-    let rows = load_sessions(&args.db)?;
-    if rows.is_empty() {
-        bail!("no sessions found in {}", args.db.display());
-    }
-
-    let mut app = App::new(rows);
-
-    if args.print_path {
-        let mut terminal = ratatui::init();
-        let action = run_app(&mut terminal, &mut app);
-        restore_terminal();
-
-        let AppAction::Replay(path) = action? else {
-            return Ok(());
-        };
-        println!("{}", path.display());
-        return Ok(());
-    }
-
-    loop {
-        let mut terminal = ratatui::init();
-        let action = run_app(&mut terminal, &mut app);
-        restore_terminal();
-
-        match action? {
-            AppAction::Quit => return Ok(()),
-            AppAction::Replay(path) => {
-                let mut command = Command::new(&args.replay_command);
-                if args.include_exec {
-                    command.arg("--include-exec");
-                }
-                let status = command.arg(path).status()?;
-                app.status = if status.success() {
-                    None
-                } else {
-                    Some(format!(
-                        "{} exited with status {}",
-                        args.replay_command,
-                        status.code().unwrap_or(1)
-                    ))
-                };
-            }
-        }
-    }
-}
-
-struct Args {
-    db: PathBuf,
-    replay_command: String,
-    record_command: String,
-    refresh: bool,
-    print_path: bool,
-    include_exec: bool,
-}
-
-impl Args {
-    fn parse(mut args: impl Iterator<Item = String>) -> Result<Self> {
-        let mut parsed = Self {
-            db: home_dir()?.join("codex-session-info.sqlite3"),
-            replay_command: "codex-replay-tui".to_string(),
-            record_command: default_record_command(),
-            refresh: true,
-            print_path: false,
-            include_exec: false,
-        };
-
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--db" => {
-                    let Some(value) = args.next() else {
-                        bail!("{arg} requires a path");
-                    };
-                    parsed.db = expand_home(&value)?;
-                }
-                "--replay-command" => {
-                    let Some(value) = args.next() else {
-                        bail!("{arg} requires a command");
-                    };
-                    parsed.replay_command = value;
-                }
-                "--record-command" => {
-                    let Some(value) = args.next() else {
-                        bail!("{arg} requires a command");
-                    };
-                    parsed.record_command = value;
-                }
-                "--no-refresh" => parsed.refresh = false,
-                "--print-path" => parsed.print_path = true,
-                "--include-exec" => parsed.include_exec = true,
-                "-h" | "--help" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                "-V" | "--version" => {
-                    println!("select-codex-session {}", env!("CARGO_PKG_VERSION"));
-                    std::process::exit(0);
-                }
-                _ => bail!("unknown argument: {arg}"),
-            }
-        }
-
-        Ok(parsed)
-    }
-}
-
-fn refresh_database(args: &Args) -> Result<()> {
-    let status = Command::new(&args.record_command)
-        .args(record_command_args(&args.db, args.include_exec))
-        .status()?;
-
-    if !status.success() {
-        bail!(
-            "{} failed with status {}",
-            args.record_command,
-            status.code().unwrap_or(1)
-        );
-    }
-
-    Ok(())
-}
-
-fn record_command_args(db: &std::path::Path, include_exec: bool) -> Vec<String> {
-    let mut args = vec!["--output".to_string(), db.to_string_lossy().to_string()];
-    if include_exec {
-        args.push("--include-exec".to_string());
-    }
-    args
-}
-
-fn default_record_command() -> String {
-    env::current_exe()
-        .ok()
-        .as_deref()
-        .and_then(default_record_command_from_exe)
-        .unwrap_or_else(|| "record-codex-session-info".to_string())
-}
-
-fn default_record_command_from_exe(exe: &std::path::Path) -> Option<String> {
-    let candidate = exe.parent()?.join("record-codex-session-info");
-    candidate
-        .exists()
-        .then(|| candidate.to_string_lossy().to_string())
-}
-
-fn restore_terminal() {
-    ratatui::restore();
-    let _ = execute!(io::stdout(), cursor::Show);
-}
+use crate::{SessionRow, session_date, terminal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -193,12 +35,12 @@ enum SearchScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum AppAction {
+pub(crate) enum SelectorAction {
     Quit,
-    Replay(PathBuf),
+    OpenReplay(PathBuf),
 }
 
-struct App {
+pub(crate) struct SelectorApp {
     rows: Vec<SessionRow>,
     filtered: Vec<SessionRow>,
     list_state: ListState,
@@ -212,8 +54,8 @@ struct App {
     status: Option<String>,
 }
 
-impl App {
-    fn new(rows: Vec<SessionRow>) -> Self {
+impl SelectorApp {
+    pub(crate) fn new(rows: Vec<SessionRow>) -> Self {
         let filtered = rows.clone();
         let mut list_state = ListState::default();
         list_state.select(Some(0));
@@ -367,9 +209,24 @@ impl App {
             self.move_previous();
         }
     }
+
+    pub(crate) fn clear_status(&mut self) {
+        self.status = None;
+    }
+
+    pub(crate) fn set_status(&mut self, status: impl Into<String>) {
+        self.status = Some(status.into());
+    }
 }
 
-fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<AppAction> {
+pub(crate) fn run(app: &mut SelectorApp) -> Result<SelectorAction> {
+    terminal::with_terminal(|terminal| run_event_loop(terminal, app))
+}
+
+fn run_event_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut SelectorApp,
+) -> Result<SelectorAction> {
     loop {
         terminal.draw(|frame| render(frame, app))?;
 
@@ -382,12 +239,12 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<App
                 match app.mode {
                     Mode::Normal => match key.code {
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(AppAction::Quit);
+                            return Ok(SelectorAction::Quit);
                         }
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(AppAction::Quit),
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(SelectorAction::Quit),
                         KeyCode::Enter => {
                             if let Some(path) = app.selected_path() {
-                                return Ok(AppAction::Replay(path));
+                                return Ok(SelectorAction::OpenReplay(path));
                             }
                         }
                         KeyCode::Char('/') => app.mode = Mode::Search,
@@ -425,7 +282,7 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<App
                     },
                     Mode::Search => match key.code {
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(AppAction::Quit);
+                            return Ok(SelectorAction::Quit);
                         }
                         KeyCode::Esc => app.mode = Mode::Normal,
                         KeyCode::Enter => app.mode = Mode::Normal,
@@ -446,7 +303,7 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<App
     }
 }
 
-fn render(frame: &mut Frame, app: &mut App) {
+fn render(frame: &mut Frame, app: &mut SelectorApp) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -472,7 +329,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+fn render_header(frame: &mut Frame, area: Rect, app: &SelectorApp) {
     let selected = app
         .selected_index()
         .map(|index| format!("{}/{}", index + 1, app.filtered.len()))
@@ -496,7 +353,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(header, area);
 }
 
-fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
+fn render_list(frame: &mut Frame, area: Rect, app: &mut SelectorApp) {
     let items: Vec<ListItem> = app
         .filtered
         .iter()
@@ -536,7 +393,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-fn render_message(frame: &mut Frame, area: Rect, app: &App) {
+fn render_message(frame: &mut Frame, area: Rect, app: &SelectorApp) {
     let Some(row) = app.selected_row() else {
         let empty = Paragraph::new("No matching sessions")
             .block(Block::new().title(" First Message ").borders(Borders::ALL));
@@ -574,7 +431,7 @@ fn render_message(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
     let status = app
         .status
         .as_deref()
@@ -644,7 +501,7 @@ fn render_help(frame: &mut Frame) {
         Line::raw("  Esc             leave search/help or quit"),
         Line::raw(""),
         Line::raw("Other"),
-        Line::raw("  Enter           run codex-replay-tui with selected jsonl path"),
+        Line::raw("  Enter           replay the selected jsonl path"),
         Line::raw("                  return from replay to this selector when replay exits"),
         Line::raw("  y               copy `codex resume <session-id>` to clipboard"),
         Line::raw("  ?               toggle help"),
@@ -818,62 +675,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn print_help() {
-    println!(
-        "\
-select-codex-session {version}
-
-Open a TUI for choosing a local Codex session and replaying its JSONL timeline.
-
-Usage:
-  select-codex-session [OPTIONS]
-
-Options:
-      --db PATH                  SQLite index path
-                                 default: ~/codex-session-info.sqlite3
-      --record-command COMMAND   Recorder binary used during refresh
-                                 default: sibling record-codex-session-info, then PATH
-      --replay-command COMMAND   Replay binary used after selection
-                                 default: codex-replay-tui
-      --no-refresh               Do not rebuild the SQLite index before opening
-      --include-exec             Index and show command execution records
-                                 passed to recorder during refresh and replay after selection
-      --print-path               Print the selected JSONL path instead of replaying
-  -h, --help                     Show this help
-  -V, --version                  Show version
-
-Keys:
-  Enter                          replay selected session, then return here
-  /                              interactive search
-  Tab                            switch pane focus; while searching, cycle search scope
-  h/l or Left/Right              horizontal scroll in sessions pane
-  y                              copy `codex resume <session-id>` to clipboard
-  q, Esc, Ctrl-C                 quit
-",
-        version = env!("CARGO_PKG_VERSION")
-    );
-}
-
-fn home_dir() -> Result<PathBuf> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("HOME is not set"))
-}
-
-fn expand_home(value: &str) -> Result<PathBuf> {
-    if value == "~" {
-        return home_dir();
-    }
-    if let Some(rest) = value.strip_prefix("~/") {
-        return Ok(home_dir()?.join(rest));
-    }
-    Ok(PathBuf::from(value))
-}
-
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
 
     fn sample_rows() -> Vec<SessionRow> {
@@ -885,7 +688,7 @@ mod tests {
                 cwd: Some("/repo/alpha".to_string()),
                 repository_url: Some("https://git.example/alpha.git".to_string()),
                 branch: Some("main".to_string()),
-                first_message: "fix docker compose".to_string(),
+                first_message: "Fix README parser".to_string(),
                 is_subsession: false,
             },
             SessionRow {
@@ -899,56 +702,6 @@ mod tests {
                 is_subsession: false,
             },
         ]
-    }
-
-    #[test]
-    fn record_command_args_write_to_selected_db() {
-        assert_eq!(
-            record_command_args(Path::new("/tmp/session.sqlite3"), false),
-            vec!["--output".to_string(), "/tmp/session.sqlite3".to_string()]
-        );
-        assert_eq!(
-            record_command_args(Path::new("/tmp/session.sqlite3"), true),
-            vec![
-                "--output".to_string(),
-                "/tmp/session.sqlite3".to_string(),
-                "--include-exec".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn default_record_command_prefers_sibling_binary() {
-        let dir = std::env::temp_dir().join(format!(
-            "codex-session-selector-test-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("select-codex-session");
-        let recorder = dir.join("record-codex-session-info");
-        std::fs::write(&recorder, "").unwrap();
-
-        assert_eq!(
-            default_record_command_from_exe(&exe),
-            Some(recorder.to_string_lossy().to_string())
-        );
-
-        let _ = std::fs::remove_file(recorder);
-        let _ = std::fs::remove_dir(dir);
-    }
-
-    #[test]
-    fn args_refresh_by_default_and_can_disable_it() {
-        let args = Args::parse(std::iter::empty()).unwrap();
-        assert!(args.refresh);
-        assert!(args.record_command.ends_with("record-codex-session-info"));
-        assert!(!args.include_exec);
-
-        let args = Args::parse(["--no-refresh".to_string()].into_iter()).unwrap();
-        assert!(!args.refresh);
-
-        let args = Args::parse(["--include-exec".to_string()].into_iter()).unwrap();
-        assert!(args.include_exec);
     }
 
     #[test]
@@ -966,10 +719,10 @@ mod tests {
         let rows = sample_rows();
 
         assert_eq!(
-            filter_sessions_by_scope(&rows, "docker", SearchScope::FirstMessage)[0].path,
+            filter_sessions_by_scope(&rows, "README", SearchScope::FirstMessage)[0].path,
             PathBuf::from("/tmp/a.jsonl")
         );
-        assert!(filter_sessions_by_scope(&rows, "docker", SearchScope::Cwd).is_empty());
+        assert!(filter_sessions_by_scope(&rows, "README", SearchScope::Cwd).is_empty());
         assert_eq!(
             filter_sessions_by_scope(&rows, "beta", SearchScope::Cwd)[0].path,
             PathBuf::from("/tmp/b.jsonl")
@@ -1003,6 +756,22 @@ mod tests {
         for pair in scopes.windows(2) {
             assert_eq!(pair[0].next(), pair[1]);
         }
+    }
+
+    #[test]
+    fn search_remains_case_insensitive_all_terms_substring_match() {
+        let rows = sample_rows();
+        let filtered = filter_sessions_by_scope(&rows, "FIX read", SearchScope::All);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].first_message, "Fix README parser");
+    }
+
+    #[test]
+    fn exec_text_is_not_a_selector_search_scope() {
+        assert_eq!(SearchScope::All.next(), SearchScope::FirstMessage);
+        assert_eq!(SearchScope::Repository.next(), SearchScope::Date);
+        assert_eq!(SearchScope::Date.next(), SearchScope::All);
     }
 
     #[test]

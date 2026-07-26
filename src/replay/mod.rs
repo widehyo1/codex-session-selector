@@ -1,17 +1,7 @@
-use std::{
-    collections::HashMap,
-    env,
-    io::{self, Read},
-    path::PathBuf,
-    time::Duration,
-};
+use std::{collections::HashMap, io::Read, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
-use crossterm::{
-    cursor,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    execute,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
@@ -20,6 +10,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use serde::Deserialize;
+
+use crate::{cli::ReplayOptions, terminal};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
@@ -114,7 +106,7 @@ struct Entry {
     detail: String,
 }
 
-struct App {
+struct ReplayApp {
     entries: Vec<Entry>,
     list_state: ListState,
     detail_scroll: u16,
@@ -124,7 +116,7 @@ struct App {
     status: Option<String>,
 }
 
-impl App {
+impl ReplayApp {
     fn new(entries: Vec<Entry>) -> Self {
         let mut list_state = ListState::default();
         if !entries.is_empty() {
@@ -252,125 +244,24 @@ impl App {
     }
 }
 
-fn main() -> Result<()> {
-    let args = ReplayArgs::parse(env::args().skip(1))?;
-    if args.show_help {
-        print_help();
-        return Ok(());
-    }
-    if args.show_version {
-        println!("codex-replay-tui {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
+pub(crate) fn run(options: &ReplayOptions) -> Result<()> {
+    let input = read_input(options.input.as_deref())?;
+    let entries = load_entries_from_str(&input, options.include_exec)?;
 
-    let input = read_input(args.input)?;
-    let entries = load_entries_from_str(&input, args.include_exec)?;
-
-    let mut terminal = ratatui::init();
-    let result = run_app(&mut terminal, App::new(entries));
-    restore_terminal();
-
-    result
+    terminal::with_terminal(|terminal| run_event_loop(terminal, ReplayApp::new(entries)))
 }
 
-struct ReplayArgs {
-    input: Option<PathBuf>,
-    include_exec: bool,
-    show_help: bool,
-    show_version: bool,
-}
-
-impl ReplayArgs {
-    fn parse(mut args: impl Iterator<Item = String>) -> Result<Self> {
-        let mut parsed = Self {
-            input: None,
-            include_exec: false,
-            show_help: false,
-            show_version: false,
-        };
-
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--include-exec" => parsed.include_exec = true,
-                "-h" | "--help" => parsed.show_help = true,
-                "-V" | "--version" => parsed.show_version = true,
-                "-" => {
-                    if parsed.input.replace(PathBuf::from("-")).is_some() {
-                        anyhow::bail!("only one input path may be provided");
-                    }
-                }
-                _ if arg.starts_with('-') => anyhow::bail!("unknown argument: {arg}"),
-                _ => {
-                    if parsed.input.replace(PathBuf::from(arg)).is_some() {
-                        anyhow::bail!("only one input path may be provided");
-                    }
-                }
-            }
-        }
-
-        Ok(parsed)
-    }
-}
-
-fn print_help() {
-    println!(
-        "\
-codex-replay-tui {version}
-
-Replay a Codex session JSONL file in a terminal UI.
-
-Usage:
-  codex-replay-tui [OPTIONS] <PATH>
-  codex-replay-tui [OPTIONS] -
-
-Options:
-      --include-exec     Show command execution records in the timeline
-                         default: hidden
-  -h, --help             Show this help
-  -V, --version          Show version
-
-Input:
-  PATH    Raw Codex JSONL file or a JSON array of preprocessed events
-  -       Read JSONL/JSON from stdin
-
-Recognized timeline records:
-  event_msg.payload.type == user_message
-  event_msg.payload.type == agent_message
-  event_msg.payload.type == exec_command_end (with --include-exec)
-  response_item custom_tool_call exec or function_call exec_command
-  with matching output                            (with --include-exec)
-
-Keys:
-  Tab                 switch focus between timeline/detail
-  j/k or Up/Down     move or scroll, depending on focus
-  d/u or Page keys   page move or page scroll
-  g/G                first/last event or detail top/bottom
-  1/2/f              fullscreen controls
-  y                  copy detail pane to clipboard
-  q, Esc, Ctrl-C     quit
-",
-        version = env!("CARGO_PKG_VERSION")
-    );
-}
-
-fn restore_terminal() {
-    ratatui::restore();
-    let _ = execute!(io::stdout(), cursor::Show);
-}
-
-fn read_input(input: Option<PathBuf>) -> Result<String> {
+fn read_input(input: Option<&Path>) -> Result<String> {
     match input {
-        Some(path) if path != PathBuf::from("-") => std::fs::read_to_string(&path)
+        Some(path) if path != Path::new("-") => std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display())),
         Some(_) | None => {
-            let mut input = String::new();
-            io::stdin()
-                .read_to_string(&mut input)
-                .context("failed to read stdin")?;
+            let mut stdin = std::io::stdin().lock();
+            let input = read_input_from_reader(&mut stdin)?;
 
             if input.trim().is_empty() {
                 anyhow::bail!(
-                    "usage: codex-replay-tui <events.json|events.jsonl>\n       jq -c . a.json | codex-replay-tui"
+                    "usage: select-codex-session replay <events.json|events.jsonl>\n       jq -c . a.json | select-codex-session replay"
                 );
             }
 
@@ -379,7 +270,15 @@ fn read_input(input: Option<PathBuf>) -> Result<String> {
     }
 }
 
-fn run_app(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<()> {
+fn read_input_from_reader(reader: &mut impl Read) -> Result<String> {
+    let mut input = String::new();
+    reader
+        .read_to_string(&mut input)
+        .context("failed to read stdin")?;
+    Ok(input)
+}
+
+fn run_event_loop(terminal: &mut ratatui::DefaultTerminal, mut app: ReplayApp) -> Result<()> {
     loop {
         terminal.draw(|frame| render(frame, &mut app))?;
 
@@ -874,7 +773,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
     out
 }
 
-fn render(frame: &mut Frame, app: &mut App) {
+fn render(frame: &mut Frame, app: &mut ReplayApp) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -911,7 +810,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp) {
     let selected = app
         .selected_index()
         .map(|i| format!("{}/{}", i + 1, app.entries.len()))
@@ -929,7 +828,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     frame.render_widget(header, area);
 }
 
-fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
+fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut ReplayApp) {
     let items: Vec<ListItem> = app
         .entries
         .iter()
@@ -979,7 +878,7 @@ fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-fn render_detail(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn render_detail(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp) {
     let Some(entry) = app.selected_entry() else {
         let empty = Paragraph::new("No entries")
             .block(Block::new().title(" Detail ").borders(Borders::ALL));
@@ -1048,7 +947,7 @@ fn kind_label(kind: &EntryKind) -> &'static str {
     }
 }
 
-fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp) {
     let focus = match app.focus {
         PaneFocus::Timeline => "timeline",
         PaneFocus::Detail => "detail",
@@ -1251,14 +1150,13 @@ mod tests {
     }
 
     #[test]
-    fn replay_args_enable_exec_only_when_requested() {
-        let args = ReplayArgs::parse(["session.jsonl".to_string()].into_iter()).unwrap();
-        assert!(!args.include_exec);
-        assert_eq!(args.input, Some(PathBuf::from("session.jsonl")));
+    fn reader_input_preserves_jsonl() {
+        let mut input =
+            br#"{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#.as_slice();
 
-        let args =
-            ReplayArgs::parse(["--include-exec".to_string(), "-".to_string()].into_iter()).unwrap();
-        assert!(args.include_exec);
-        assert_eq!(args.input, Some(PathBuf::from("-")));
+        assert_eq!(
+            read_input_from_reader(&mut input).unwrap(),
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#
+        );
     }
 }

@@ -1,0 +1,4 @@
+{"type":"session_meta","payload":{"id":"fixture-session","timestamp":"2026-07-26T00:00:00Z","cwd":"/tmp/fixture","source":"cli","thread_source":"user","git":{"repository_url":"https://git.example/fixture.git","branch":"main"}}}
+{"type":"event_msg","payload":{"type":"user_message","message":"one-binary smoke test"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"fixture response"}}
+{"type":"event_msg","payload":{"type":"exec_command_end","parsed_cmd":[{"type":"read","cmd":"pwd"}],"aggregated_output":"/tmp/fixture"}}
