@@ -11,7 +11,12 @@ use ratatui::{
 };
 use serde::Deserialize;
 
-use crate::{cli::ReplayOptions, terminal, ui_state::ExecVisibility};
+use crate::{
+    cli::ReplayOptions,
+    terminal,
+    ui::{bottom_scroll_offset, half_page_height, pane_content_area},
+    ui_state::ExecVisibility,
+};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
@@ -110,6 +115,9 @@ struct ReplayApp {
     visible_indices: Vec<usize>,
     list_state: ListState,
     detail_scroll: u16,
+    timeline_page_height: u16,
+    detail_page_height: u16,
+    detail_max_scroll: u16,
     focus: PaneFocus,
     fullscreen: Fullscreen,
     show_help: bool,
@@ -136,6 +144,9 @@ impl ReplayApp {
             visible_indices,
             list_state,
             detail_scroll: 0,
+            timeline_page_height: 1,
+            detail_page_height: 1,
+            detail_max_scroll: 0,
             focus: PaneFocus::Timeline,
             fullscreen: Fullscreen::None,
             show_help: false,
@@ -228,17 +239,25 @@ impl ReplayApp {
     }
 
     fn detail_page_down(&mut self) {
-        self.detail_scroll = self.detail_scroll.saturating_add(10);
+        self.detail_scroll = self
+            .detail_scroll
+            .saturating_add(half_page_height(self.detail_page_height))
+            .min(self.detail_max_scroll);
         self.status = None;
     }
 
     fn detail_page_up(&mut self) {
-        self.detail_scroll = self.detail_scroll.saturating_sub(10);
+        self.detail_scroll = self
+            .detail_scroll
+            .saturating_sub(half_page_height(self.detail_page_height));
         self.status = None;
     }
 
     fn detail_line_down(&mut self) {
-        self.detail_scroll = self.detail_scroll.saturating_add(1);
+        self.detail_scroll = self
+            .detail_scroll
+            .saturating_add(1)
+            .min(self.detail_max_scroll);
         self.status = None;
     }
 
@@ -256,18 +275,22 @@ impl ReplayApp {
     }
 
     fn toggle_timeline_fullscreen(&mut self) {
-        self.fullscreen = match self.fullscreen {
-            Fullscreen::Timeline => Fullscreen::None,
-            _ => Fullscreen::Timeline,
-        };
+        if self.fullscreen == Fullscreen::Timeline {
+            self.fullscreen = Fullscreen::None;
+        } else {
+            self.focus = PaneFocus::Timeline;
+            self.fullscreen = Fullscreen::Timeline;
+        }
         self.status = None;
     }
 
     fn toggle_detail_fullscreen(&mut self) {
-        self.fullscreen = match self.fullscreen {
-            Fullscreen::Detail => Fullscreen::None,
-            _ => Fullscreen::Detail,
-        };
+        if self.fullscreen == Fullscreen::Detail {
+            self.fullscreen = Fullscreen::None;
+        } else {
+            self.focus = PaneFocus::Detail;
+            self.fullscreen = Fullscreen::Detail;
+        }
         self.status = None;
     }
 
@@ -371,14 +394,22 @@ impl ReplayApp {
             }
             KeyCode::Char('d') | KeyCode::PageDown => {
                 match self.focus {
-                    PaneFocus::Timeline => self.next(),
+                    PaneFocus::Timeline => {
+                        for _ in 0..half_page_height(self.timeline_page_height) {
+                            self.next();
+                        }
+                    }
                     PaneFocus::Detail => self.detail_page_down(),
                 }
                 ReplayControl::Continue
             }
             KeyCode::Char('u') | KeyCode::PageUp => {
                 match self.focus {
-                    PaneFocus::Timeline => self.previous(),
+                    PaneFocus::Timeline => {
+                        for _ in 0..half_page_height(self.timeline_page_height) {
+                            self.previous();
+                        }
+                    }
                     PaneFocus::Detail => self.detail_page_up(),
                 }
                 ReplayControl::Continue
@@ -407,7 +438,7 @@ impl ReplayApp {
                         }
                     }
                     PaneFocus::Detail => {
-                        self.detail_scroll = u16::MAX;
+                        self.detail_scroll = self.detail_max_scroll;
                     }
                 }
                 self.status = None;
@@ -935,6 +966,8 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp
 }
 
 fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut ReplayApp) {
+    app.timeline_page_height = pane_content_area(area).height.max(1);
+
     let items: Vec<ListItem> = app
         .visible_indices
         .iter()
@@ -986,13 +1019,27 @@ fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut ReplayA
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-fn render_detail(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp) {
-    let Some((visible_index, entry)) = app.selected_entry() else {
+fn render_detail(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut ReplayApp) {
+    let content_area = pane_content_area(area);
+    app.detail_page_height = content_area.height.max(1);
+
+    let Some((visible_index, entry)) = app
+        .selected_entry()
+        .map(|(visible_index, entry)| (visible_index, entry.clone()))
+    else {
+        app.detail_max_scroll = 0;
+        app.detail_scroll = 0;
         let empty = Paragraph::new("No entries")
             .block(Block::new().title(" Detail ").borders(Borders::ALL));
         frame.render_widget(empty, area);
         return;
     };
+
+    app.detail_max_scroll = bottom_scroll_offset(
+        detail_line_count(&entry, visible_index, content_area.width),
+        content_area.height,
+    );
+    app.detail_scroll = app.detail_scroll.min(app.detail_max_scroll);
 
     let focused = app.focus == PaneFocus::Detail || app.fullscreen == Fullscreen::Detail;
 
@@ -1011,9 +1058,9 @@ fn render_detail(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp
 
     let title = format!(
         " Detail{focus_suffix}{fullscreen_suffix}: {} ",
-        display_title(visible_index, entry)
+        display_title(visible_index, &entry)
     );
-    let text = detail_text(entry, visible_index);
+    let text = detail_text(&entry, visible_index);
 
     let paragraph = Paragraph::new(text)
         .block(
@@ -1026,6 +1073,12 @@ fn render_detail(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp
         .scroll((app.detail_scroll, 0));
 
     frame.render_widget(paragraph, area);
+}
+
+fn detail_line_count(entry: &Entry, visible_index: usize, width: u16) -> usize {
+    Paragraph::new(detail_text(entry, visible_index))
+        .wrap(Wrap { trim: false })
+        .line_count(width)
 }
 
 fn detail_text(entry: &Entry, visible_index: usize) -> Text<'static> {
@@ -1106,18 +1159,18 @@ fn render_help(frame: &mut Frame) {
         Line::raw("Timeline focus"),
         Line::raw("  j / Down        next event"),
         Line::raw("  k / Up          previous event"),
-        Line::raw("  d / PageDown    next event"),
-        Line::raw("  u / PageUp      previous event"),
+        Line::raw("  d / PageDown    move down half the timeline height"),
+        Line::raw("  u / PageUp      move up half the timeline height"),
         Line::raw("  g / Home        first event"),
         Line::raw("  G / End         last event"),
         Line::raw(""),
         Line::raw("Detail focus"),
         Line::raw("  j / Down        scroll detail down one line"),
         Line::raw("  k / Up          scroll detail up one line"),
-        Line::raw("  d / PageDown    scroll detail down one page"),
-        Line::raw("  u / PageUp      scroll detail up one page"),
+        Line::raw("  d / PageDown    scroll detail down half a page"),
+        Line::raw("  u / PageUp      scroll detail up half a page"),
         Line::raw("  g / Home        scroll detail to top"),
-        Line::raw("  G / End         scroll detail to bottom"),
+        Line::raw("  G / End         scroll detail to bottom with the last line visible"),
         Line::raw("  y               copy selected detail to clipboard"),
         Line::raw(""),
         Line::raw("Fullscreen"),
@@ -1166,9 +1219,16 @@ fn centered_rect(
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn render_at(app: &mut ReplayApp, width: u16, height: u16) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
     }
 
     fn common_fixture() -> &'static str {
@@ -1402,6 +1462,73 @@ mod tests {
             detail_text(&shown.all_entries[2], 2).lines[0].spans[1].content,
             "2"
         );
+    }
+
+    #[test]
+    fn detail_half_page_and_end_follow_the_rendered_pane_height() {
+        let entry = Entry {
+            kind: EntryKind::User,
+            summary: "USER".to_string(),
+            detail: (1..=30)
+                .map(|line| format!("line {line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        let mut app = ReplayApp::new(vec![entry], ExecVisibility::Hidden);
+        app.focus = PaneFocus::Detail;
+
+        render_at(&mut app, 100, 18);
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.detail_scroll, 7);
+
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.detail_scroll, 19);
+    }
+
+    #[test]
+    fn fullscreen_detail_syncs_focus_for_detail_navigation() {
+        let entry = Entry {
+            kind: EntryKind::User,
+            summary: "USER".to_string(),
+            detail: (1..=30)
+                .map(|line| format!("line {line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        let mut app = ReplayApp::new(vec![entry], ExecVisibility::Hidden);
+
+        render_at(&mut app, 100, 18);
+        app.handle_key(key(KeyCode::Char('2')));
+        assert_eq!(app.fullscreen, Fullscreen::Detail);
+        assert_eq!(app.focus, PaneFocus::Detail);
+
+        render_at(&mut app, 100, 18);
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.detail_scroll, 19);
+    }
+
+    #[test]
+    fn timeline_half_page_follows_the_rendered_pane_height() {
+        let entries = (0..20)
+            .map(|index| Entry {
+                kind: EntryKind::User,
+                summary: format!("USER {index}"),
+                detail: String::new(),
+            })
+            .collect();
+        let mut app = ReplayApp::new(entries, ExecVisibility::Hidden);
+
+        render_at(&mut app, 100, 18);
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.selected_visible_index(), Some(7));
+
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.selected_visible_index(), Some(0));
+
+        app.handle_key(key(KeyCode::Char('G')));
+        render_at(&mut app, 100, 18);
+        assert_eq!(app.selected_visible_index(), Some(19));
+        assert_eq!(app.list_state.offset(), 6);
     }
 
     #[test]

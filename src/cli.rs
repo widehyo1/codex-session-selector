@@ -248,10 +248,16 @@ Keys:
   Enter                          replay selected session, then return here
   /                              interactive search
   Tab                            switch pane focus; while searching, cycle scope
-  h/l or Left/Right              horizontal scroll in sessions pane
+  j/k or Up/Down                 move selection or scroll the focused message by one line
+  d/u or Page keys               move selection or scroll the focused pane by half its height
+  g/G or Home/End                first/last selection or message top/bottom (last line visible)
+  h/l or Left/Right              horizontal scroll session metadata
+  0                              reset horizontal scroll
   e                              toggle exec entries for replay
   y                              copy `codex resume <session-id>` to clipboard
-  q, Esc, Ctrl-C                 quit",
+  ?                              show help
+  q, Ctrl-C                      quit
+  Esc                            quit normally; leave search or help when open",
         version = env!("CARGO_PKG_VERSION")
     )
 }
@@ -308,12 +314,13 @@ Input:
 Keys:
   Tab                switch focus between timeline/detail
   j/k or Up/Down     move or scroll, depending on focus
-  d/u or Page keys   page move or page scroll
-  g/G                first/last event or detail top/bottom
+  d/u or Page keys   half-pane move or scroll
+  g/G or Home/End    first/last event or detail top/bottom (last line visible)
   1/2/f              fullscreen controls
   e                  toggle command execution entries
-  y                  copy detail pane to clipboard
-  q, Esc, Ctrl-C     quit",
+  y                  copy detail pane when detail is focused
+  q, Ctrl-C          quit
+  Esc                quit normally; leave fullscreen or help when open",
         version = env!("CARGO_PKG_VERSION")
     )
 }

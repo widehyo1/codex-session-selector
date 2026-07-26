@@ -14,6 +14,7 @@ use crate::{
     SessionRow,
     indexer::search::{QueryError, SearchIndex, SearchScope, is_corruption},
     session_date, terminal,
+    ui::{bottom_scroll_offset, half_page_height, pane_content_area},
     ui_state::ExecVisibility,
 };
 
@@ -46,6 +47,9 @@ pub(crate) struct SelectorApp {
     focus: PaneFocus,
     metadata_scroll: usize,
     message_scroll: u16,
+    sessions_page_height: u16,
+    message_page_height: u16,
+    message_max_scroll: u16,
     show_help: bool,
     exec_visibility: ExecVisibility,
     status: Option<String>,
@@ -75,6 +79,9 @@ impl SelectorApp {
             focus: PaneFocus::Sessions,
             metadata_scroll: 0,
             message_scroll: 0,
+            sessions_page_height: 1,
+            message_page_height: 1,
+            message_max_scroll: 0,
             show_help: false,
             exec_visibility,
             status: None,
@@ -138,7 +145,10 @@ impl SelectorApp {
     }
 
     fn message_line_down(&mut self) {
-        self.message_scroll = self.message_scroll.saturating_add(1);
+        self.message_scroll = self
+            .message_scroll
+            .saturating_add(1)
+            .min(self.message_max_scroll);
     }
 
     fn message_line_up(&mut self) {
@@ -146,11 +156,16 @@ impl SelectorApp {
     }
 
     fn message_page_down(&mut self) {
-        self.message_scroll = self.message_scroll.saturating_add(10);
+        self.message_scroll = self
+            .message_scroll
+            .saturating_add(half_page_height(self.message_page_height))
+            .min(self.message_max_scroll);
     }
 
     fn message_page_up(&mut self) {
-        self.message_scroll = self.message_scroll.saturating_sub(10);
+        self.message_scroll = self
+            .message_scroll
+            .saturating_sub(half_page_height(self.message_page_height));
     }
 
     fn copy_resume_command_to_clipboard(&mut self) {
@@ -300,14 +315,18 @@ impl SelectorApp {
                 }
                 KeyCode::Char('d') | KeyCode::PageDown => {
                     match self.focus {
-                        PaneFocus::Sessions => self.page_down(10),
+                        PaneFocus::Sessions => {
+                            self.page_down(usize::from(half_page_height(self.sessions_page_height)))
+                        }
                         PaneFocus::Message => self.message_page_down(),
                     }
                     None
                 }
                 KeyCode::Char('u') | KeyCode::PageUp => {
                     match self.focus {
-                        PaneFocus::Sessions => self.page_up(10),
+                        PaneFocus::Sessions => {
+                            self.page_up(usize::from(half_page_height(self.sessions_page_height)))
+                        }
                         PaneFocus::Message => self.message_page_up(),
                     }
                     None
@@ -322,7 +341,7 @@ impl SelectorApp {
                 KeyCode::Char('G') | KeyCode::End => {
                     match self.focus {
                         PaneFocus::Sessions => self.move_last(),
-                        PaneFocus::Message => self.message_scroll = u16::MAX,
+                        PaneFocus::Message => self.message_scroll = self.message_max_scroll,
                     }
                     None
                 }
@@ -440,6 +459,8 @@ fn render_header(frame: &mut Frame, area: Rect, app: &SelectorApp) {
 }
 
 fn render_list(frame: &mut Frame, area: Rect, app: &mut SelectorApp) {
+    app.sessions_page_height = pane_content_area(area).height.max(1);
+
     let items: Vec<ListItem> = app
         .filtered
         .iter()
@@ -479,30 +500,39 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut SelectorApp) {
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-fn render_message(frame: &mut Frame, area: Rect, app: &SelectorApp) {
-    let Some(row) = app.selected_row() else {
+fn render_message(frame: &mut Frame, area: Rect, app: &mut SelectorApp) {
+    let content_area = pane_content_area(area);
+    app.message_page_height = content_area.height.max(1);
+
+    let Some((first_message, date)) = app
+        .selected_row()
+        .map(|row| (row.first_message.clone(), session_date(row)))
+    else {
+        app.message_max_scroll = 0;
+        app.message_scroll = 0;
         let empty = Paragraph::new("No matching sessions")
             .block(Block::new().title(" First Message ").borders(Borders::ALL));
         frame.render_widget(empty, area);
         return;
     };
 
+    app.message_max_scroll = bottom_scroll_offset(
+        message_line_count(&first_message, content_area.width),
+        content_area.height,
+    );
+    app.message_scroll = app.message_scroll.min(app.message_max_scroll);
+
     let title = if app.focus == PaneFocus::Message {
-        format!(" First Message [focus]: {} ", session_date(row))
+        format!(" First Message [focus]: {date} ")
     } else {
-        format!(" First Message: {} ", session_date(row))
+        format!(" First Message: {date} ")
     };
     let border_style = if app.focus == PaneFocus::Message {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default()
     };
-    let text = Text::from(
-        row.first_message
-            .lines()
-            .map(|line| Line::raw(line.to_string()))
-            .collect::<Vec<_>>(),
-    );
+    let text = message_text(&first_message);
 
     let paragraph = Paragraph::new(text)
         .block(
@@ -515,6 +545,21 @@ fn render_message(frame: &mut Frame, area: Rect, app: &SelectorApp) {
         .scroll((app.message_scroll, 0));
 
     frame.render_widget(paragraph, area);
+}
+
+fn message_line_count(message: &str, width: u16) -> usize {
+    Paragraph::new(message_text(message))
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+}
+
+fn message_text(message: &str) -> Text<'static> {
+    Text::from(
+        message
+            .lines()
+            .map(|line| Line::raw(line.to_string()))
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
@@ -530,7 +575,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             Span::styled(app.focus.label(), Style::default().fg(Color::Cyan)),
             Span::raw(" | "),
             Span::raw(" j/k ↑/↓ move "),
-            Span::raw(" d/u page "),
+            Span::raw(" d/u half-page "),
             Span::raw(" g/G first/last "),
             Span::raw(" h/l ←/→ x-scroll "),
             Span::raw(" Tab focus "),
@@ -572,14 +617,14 @@ fn render_help(frame: &mut Frame) {
         Line::raw("  Tab             switch focus between sessions/message"),
         Line::raw(""),
         Line::raw("Movement"),
-        Line::raw("  j / Down        next session"),
-        Line::raw("  k / Up          previous session"),
-        Line::raw("  d / PageDown    page down"),
-        Line::raw("  u / PageUp      page up"),
-        Line::raw("  g / Home        first session"),
-        Line::raw("  G / End         last session"),
-        Line::raw("  h / Left        horizontal scroll left in sessions pane"),
-        Line::raw("  l / Right       horizontal scroll right in sessions pane"),
+        Line::raw("  j / Down        next session or scroll message down one line"),
+        Line::raw("  k / Up          previous session or scroll message up one line"),
+        Line::raw("  d / PageDown    move or scroll the focused pane down half a page"),
+        Line::raw("  u / PageUp      move or scroll the focused pane up half a page"),
+        Line::raw("  g / Home        first session or message top"),
+        Line::raw("  G / End         last session or message bottom (last line visible)"),
+        Line::raw("  h / Left        horizontal scroll session metadata left"),
+        Line::raw("  l / Right       horizontal scroll session metadata right"),
         Line::raw("  0               reset horizontal scroll"),
         Line::raw(""),
         Line::raw("Search"),
@@ -747,9 +792,16 @@ mod tests {
         test_support::SessionFixture,
     };
     use crossterm::event::{KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn render_at(app: &mut SelectorApp, width: u16, height: u16) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
     }
 
     fn sample_rows() -> Vec<SessionRow> {
@@ -870,6 +922,42 @@ mod tests {
         assert_eq!(shown.exec_visibility(), ExecVisibility::Shown);
         assert_eq!(hidden.filtered.len(), 2);
         assert_eq!(shown.filtered.len(), 2);
+    }
+
+    #[test]
+    fn message_half_page_and_end_follow_the_rendered_pane_height() {
+        let (_fixture, mut app) = sample_app(ExecVisibility::Hidden);
+        app.filtered[0].first_message = (1..=30)
+            .map(|line| format!("line {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.focus = PaneFocus::Message;
+
+        render_at(&mut app, 100, 18);
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.message_scroll, 7);
+
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.message_scroll, 16);
+    }
+
+    #[test]
+    fn sessions_half_page_follows_the_rendered_pane_height() {
+        let (_fixture, mut app) = sample_app(ExecVisibility::Hidden);
+        app.filtered = vec![app.filtered[0].clone(); 20];
+        app.list_state.select(Some(0));
+
+        render_at(&mut app, 100, 18);
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.selected_index(), Some(7));
+
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.selected_index(), Some(0));
+
+        app.handle_key(key(KeyCode::Char('G')));
+        render_at(&mut app, 100, 18);
+        assert_eq!(app.selected_index(), Some(19));
+        assert_eq!(app.list_state.offset(), 6);
     }
 
     #[test]

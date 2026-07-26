@@ -98,9 +98,9 @@ An override value is treated as one executable path, not as a shell command.
 
 ### Selector controls
 
-- `j/k` or `Up/Down`: move selection
-- `d/u` or `PageDown/PageUp`: page selection or message scroll
-- `g/G`: first/last selection or message top/bottom
+- `j/k` or `Up/Down`: move selection or scroll the focused message by one line
+- `d/u` or `PageDown/PageUp`: move selection or scroll the focused pane by half its visible height
+- `g/G` or `Home/End`: first/last selection or message top/bottom; `G` places the last line at the bottom when it overflows
 - `Tab`: switch focus between sessions and first message
 - `h/l` or `Left/Right`: horizontally scroll session metadata
 - `0`: reset horizontal scroll
@@ -110,7 +110,8 @@ An override value is treated as one executable path, not as a shell command.
 - `Enter`: replay the selected session, then return to the selector
 - `y`: copy `codex resume <session-id>` to the clipboard
 - `?`: show help
-- `q`, `Esc`, or `Ctrl-C`: quit
+- `q` or `Ctrl-C`: quit
+- `Esc`: quit normally; leave search or help when open
 
 Search uses the persistent FTS5 index and BM25 relevance. Bare
 whitespace-separated terms are combined with AND and match token prefixes:
@@ -208,15 +209,16 @@ in-memory timeline immediately without rereading the JSONL.
 
 - `Tab`: switch focus between timeline and detail
 - `j/k` or `Up/Down`: move through events or scroll detail
-- `d/u` or `PageDown/PageUp`: move an event or scroll detail by a page
-- `g/G` or `Home/End`: first/last event or detail top/bottom
+- `d/u` or `PageDown/PageUp`: move an event or scroll detail by half the focused pane's visible height
+- `g/G` or `Home/End`: first/last event or detail top/bottom; `G` places the last detail line at the bottom when it overflows
 - `1`: toggle timeline fullscreen
 - `2`: toggle detail fullscreen
 - `f`: toggle the focused pane fullscreen
 - `e`: toggle command-execution entries
-- `y`: copy the detail pane to the clipboard
+- `y`: copy the detail pane to the clipboard when detail is focused
 - `?`: show help
-- `q`, `Esc`, or `Ctrl-C`: quit
+- `q` or `Ctrl-C`: quit
+- `Esc`: quit normally; leave fullscreen or help when open
 
 ## Migration from 0.2
 

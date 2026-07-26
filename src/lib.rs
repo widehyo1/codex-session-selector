@@ -15,6 +15,7 @@ mod indexer;
 mod replay;
 mod selector;
 mod terminal;
+mod ui;
 mod ui_state;
 
 #[cfg(test)]
