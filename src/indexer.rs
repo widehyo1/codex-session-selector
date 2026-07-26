@@ -8,8 +8,10 @@ use anyhow::{Result, bail};
 
 use crate::cli::IndexOptions;
 
+pub(crate) mod fts;
 pub(crate) mod scan;
 pub(crate) mod schema;
+pub(crate) mod search;
 pub(crate) mod store;
 
 use scan::{ScanPlan, StoredSource, scan_sources};
@@ -60,6 +62,7 @@ pub(crate) struct IndexOutcome {
 pub(crate) fn build_index(options: &IndexOptions) -> Result<IndexOutcome> {
     let root = absolute_lexical_path(&options.sessions_root)?;
     let mut conn = store::open_configured_connection(&options.output)?;
+    fts::verify_runtime(&conn)?;
     let state = detect_schema(&conn)?;
     let mode = choose_mode(&state, &root, options.rebuild)?;
     let stored = match mode {
@@ -69,10 +72,25 @@ pub(crate) fn build_index(options: &IndexOptions) -> Result<IndexOutcome> {
     let plan = scan_sources(&root, &stored, mode == IndexMode::Rebuild)?;
 
     let tx = store::begin_immediate(&mut conn)?;
+    let fts_mode = match (&state, mode) {
+        (SchemaState::CanonicalV1 { .. }, IndexMode::Incremental) => {
+            fts::create_schema(&tx)?;
+            fts::FtsSyncMode::Populate
+        }
+        (SchemaState::Current { .. }, IndexMode::Incremental) => fts::preflight(&tx)?,
+        _ => fts::FtsSyncMode::Populate,
+    };
     let mut delta = match mode {
         IndexMode::Incremental => store::apply_incremental(&tx, &root, &plan)?,
         IndexMode::Rebuild => store::apply_rebuild(&tx, &root, &plan)?,
     };
+    match fts_mode {
+        fts::FtsSyncMode::Delta => fts::apply_delta(&tx, &delta)?,
+        fts::FtsSyncMode::Populate => fts::populate_all(&tx)?,
+        fts::FtsSyncMode::Rebuild => fts::rebuild(&tx)?,
+    }
+    fts::verify_invariants(&tx, fts_mode != fts::FtsSyncMode::Delta)?;
+    fts::mark_clean(&tx)?;
     store::verify_invariants(&tx)?;
     store::set_schema_version(&tx)?;
     let counts = store::query_counts(&tx)?;
@@ -88,12 +106,12 @@ pub(crate) fn build_index(options: &IndexOptions) -> Result<IndexOutcome> {
 fn choose_mode(state: &SchemaState, root: &Path, rebuild: bool) -> Result<IndexMode> {
     match state {
         SchemaState::Empty | SchemaState::Legacy => Ok(IndexMode::Rebuild),
-        SchemaState::Current { sessions_root }
+        SchemaState::CanonicalV1 { sessions_root } | SchemaState::Current { sessions_root }
             if rebuild || sessions_root.to_string_lossy() != root.to_string_lossy() =>
         {
             Ok(IndexMode::Rebuild)
         }
-        SchemaState::Current { .. } => Ok(IndexMode::Incremental),
+        SchemaState::CanonicalV1 { .. } | SchemaState::Current { .. } => Ok(IndexMode::Incremental),
         SchemaState::Future { version } => bail!(
             "index schema version {version} is newer than supported version {}; refusing to overwrite it",
             schema::SCHEMA_VERSION
@@ -212,12 +230,12 @@ mod tests {
         assert_eq!(table_count(&connection, "sessions"), 1);
         assert_eq!(table_count(&connection, "exec_events"), 3);
         assert!(table_exists(&connection, "source_files"));
-        assert!(!table_exists(&connection, "sessions_fts"));
+        assert!(table_exists(&connection, "sessions_fts"));
         assert_eq!(
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            1
+            2
         );
     }
 
@@ -365,7 +383,7 @@ mod tests {
         let outcome = build_index(&options).unwrap();
         assert_eq!(outcome.summary.mode, IndexMode::Incremental);
         assert_eq!(outcome.summary.parsed_files, 0);
-        let conn = Connection::open(db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         assert!(
             conn.query_row(
                 "SELECT EXISTS(
@@ -409,7 +427,7 @@ mod tests {
         let contents = fs::read_to_string(&source)
             .unwrap()
             .replace("real user request", "updated user request with more detail")
-            .replace("Script completed", "Script completed after update");
+            .replace("Script completed", "Execution refreshed");
         fs::write(&source, contents).unwrap();
 
         let outcome = build_index(&options).unwrap();
@@ -418,7 +436,7 @@ mod tests {
         assert_eq!(outcome.delta.updated_exec_keys, vec![exec_key]);
         assert_eq!(outcome.delta.touched_session_keys, vec![session_key]);
 
-        let conn = Connection::open(db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         assert_eq!(
             conn.query_row("SELECT source_key FROM source_files", [], |row| {
                 row.get::<_, i64>(0)
@@ -441,6 +459,34 @@ mod tests {
             )
             .unwrap(),
             exec_key
+        );
+        drop(conn);
+        let index = search::SearchIndex::open(&db, store::SessionView::default()).unwrap();
+        assert_eq!(
+            index
+                .search("updated", search::SearchScope::FirstMessage)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            index
+                .search("real", search::SearchScope::FirstMessage)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            index
+                .search("execution", search::SearchScope::Exec)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            index
+                .search("script", search::SearchScope::Exec)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -578,6 +624,197 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn schema_v1_migrates_without_reparsing_unchanged_sources() {
+        let fixture = SessionFixture::new();
+        fixture.write_session_with_exec();
+        let db = fixture.path("index.sqlite3");
+        let options = options(&fixture, db.clone());
+        build_index(&options).unwrap();
+
+        let mut conn = store::open_configured_connection(&db).unwrap();
+        let tx = store::begin_immediate(&mut conn).unwrap();
+        fts::drop_schema(&tx).unwrap();
+        tx.execute_batch("PRAGMA user_version = 1;").unwrap();
+        tx.commit().unwrap();
+        assert!(matches!(
+            schema::detect_schema(&conn).unwrap(),
+            SchemaState::CanonicalV1 { .. }
+        ));
+        drop(conn);
+
+        let outcome = build_index(&options).unwrap();
+        assert_eq!(outcome.summary.mode, IndexMode::Incremental);
+        assert_eq!(outcome.summary.parsed_files, 0);
+        let index = search::SearchIndex::open(&db, store::SessionView::default()).unwrap();
+        assert_eq!(
+            index
+                .search("read", search::SearchScope::Exec)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn dirty_fts_is_rebuilt_without_changing_session_key() {
+        let fixture = SessionFixture::new();
+        fixture.write_named_session("session.jsonl", "original token", false);
+        let db = fixture.path("index.sqlite3");
+        let options = options(&fixture, db.clone());
+        build_index(&options).unwrap();
+
+        let conn = Connection::open(&db).unwrap();
+        let key = conn
+            .query_row("SELECT session_key FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        conn.execute(
+            "UPDATE sessions SET first_message = 'external replacement'
+             WHERE session_key = ?1",
+            rusqlite::params![key],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT dirty FROM fts_sync_state", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+        drop(conn);
+
+        let outcome = build_index(&options).unwrap();
+        assert_eq!(outcome.summary.parsed_files, 0);
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT session_key FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            key
+        );
+        drop(conn);
+        let index = search::SearchIndex::open(&db, store::SessionView::default()).unwrap();
+        assert_eq!(
+            index
+                .search("external", search::SearchScope::FirstMessage)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            index
+                .search("original", search::SearchScope::FirstMessage)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn missing_fts_row_is_repaired_without_canonical_rebuild() {
+        let fixture = SessionFixture::new();
+        fixture.write_named_session("session.jsonl", "repair target", false);
+        let db = fixture.path("index.sqlite3");
+        let options = options(&fixture, db.clone());
+        build_index(&options).unwrap();
+
+        let conn = Connection::open(&db).unwrap();
+        let key = conn
+            .query_row("SELECT session_key FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        conn.execute(
+            "DELETE FROM sessions_fts WHERE rowid = ?1",
+            rusqlite::params![key],
+        )
+        .unwrap();
+        drop(conn);
+
+        let outcome = build_index(&options).unwrap();
+        assert_eq!(outcome.summary.mode, IndexMode::Incremental);
+        assert_eq!(outcome.summary.parsed_files, 0);
+        let index = search::SearchIndex::open(&db, store::SessionView::default()).unwrap();
+        assert_eq!(
+            index
+                .search("repair", search::SearchScope::FirstMessage)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn extra_fts_row_is_repaired_without_canonical_rebuild() {
+        let fixture = SessionFixture::new();
+        fixture.write_named_session("session.jsonl", "repair target", false);
+        let db = fixture.path("index.sqlite3");
+        let options = options(&fixture, db.clone());
+        build_index(&options).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO sessions_fts(
+                 rowid, first_message, cwd, repository_url, branch,
+                 timestamp, date, exec_command, exec_output
+             ) VALUES (99999, 'extra', '', '', '', '', '', '', '')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let outcome = build_index(&options).unwrap();
+        assert_eq!(outcome.summary.mode, IndexMode::Incremental);
+        assert_eq!(outcome.summary.parsed_files, 0);
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sessions_fts WHERE rowid = 99999",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn forced_rebuild_repairs_corrupt_fts() {
+        let fixture = SessionFixture::new();
+        fixture.write_named_session("session.jsonl", "corruption recovery", false);
+        let db = fixture.path("index.sqlite3");
+        let mut options = options(&fixture, db.clone());
+        build_index(&options).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("DELETE FROM sessions_fts_data WHERE id > 0", [])
+            .unwrap();
+        drop(conn);
+
+        let error = search::SearchIndex::open(&db, store::SessionView::default())
+            .err()
+            .expect("corrupt FTS must not open");
+        assert!(
+            search::is_corruption(&error)
+                || error.to_string().contains("malformed")
+                || error.to_string().contains("corrupt")
+        );
+
+        options.rebuild = true;
+        assert_eq!(
+            build_index(&options).unwrap().summary.mode,
+            IndexMode::Rebuild
+        );
+        let index = search::SearchIndex::open(&db, store::SessionView::default()).unwrap();
+        assert_eq!(
+            index
+                .search("corrupt", search::SearchScope::FirstMessage)
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -636,7 +873,7 @@ mod tests {
 
         let future_db = fixture.path("future.sqlite3");
         let conn = Connection::open(&future_db).unwrap();
-        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
         drop(conn);
         let mut future_options = options(&fixture, future_db);
         future_options.rebuild = true;

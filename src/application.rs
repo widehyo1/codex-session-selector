@@ -7,7 +7,8 @@ use anyhow::{Result, bail};
 
 use crate::{
     cli::{Command, IndexOptions, ReplayOptions, SelectOptions},
-    indexer, replay,
+    indexer::{self, search::SearchIndex, store::SessionView},
+    replay,
     selector::{self, SelectorAction, SelectorApp},
     ui_state::ExecVisibility,
 };
@@ -34,19 +35,19 @@ fn run_select(options: SelectOptions) -> Result<()> {
         refresh_database(&options)?;
     }
 
-    let rows = indexer::store::load_sessions_with_view(
+    let search_index = SearchIndex::open(
         &options.db,
-        indexer::store::SessionView {
+        SessionView {
             include_subsessions: options.include_subsessions,
             include_empty_messages: options.include_empty_messages,
         },
     )?;
-    if rows.is_empty() {
-        bail!("no sessions found in {}", options.db.display());
-    }
 
     let initial_visibility = ExecVisibility::from_include_exec(options.include_exec);
-    let mut app = SelectorApp::new(rows, initial_visibility);
+    let mut app = SelectorApp::new(search_index, initial_visibility)?;
+    if app.is_empty() {
+        bail!("no sessions found in {}", options.db.display());
+    }
     if options.print_path {
         if let SelectorAction::OpenReplay(path) = selector::run(&mut app)? {
             println!("{}", path.display());

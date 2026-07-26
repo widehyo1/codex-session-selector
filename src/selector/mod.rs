@@ -10,7 +10,12 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::{SessionRow, session_date, terminal, ui_state::ExecVisibility};
+use crate::{
+    SessionRow,
+    indexer::search::{QueryError, SearchIndex, SearchScope, is_corruption},
+    session_date, terminal,
+    ui_state::ExecVisibility,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -24,16 +29,6 @@ enum PaneFocus {
     Message,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SearchScope {
-    All,
-    FirstMessage,
-    Cwd,
-    Branch,
-    Repository,
-    Date,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SelectorAction {
     Quit,
@@ -41,7 +36,8 @@ pub(crate) enum SelectorAction {
 }
 
 pub(crate) struct SelectorApp {
-    rows: Vec<SessionRow>,
+    search_index: SearchIndex,
+    total_rows: usize,
     filtered: Vec<SessionRow>,
     list_state: ListState,
     query: String,
@@ -56,15 +52,21 @@ pub(crate) struct SelectorApp {
 }
 
 impl SelectorApp {
-    pub(crate) fn new(rows: Vec<SessionRow>, exec_visibility: ExecVisibility) -> Self {
-        let filtered = rows.clone();
+    pub(crate) fn new(search_index: SearchIndex, exec_visibility: ExecVisibility) -> Result<Self> {
+        let filtered = search_index
+            .search("", SearchScope::All)?
+            .into_iter()
+            .map(|hit| hit.row)
+            .collect::<Vec<_>>();
+        let total_rows = filtered.len();
         let mut list_state = ListState::default();
         if !filtered.is_empty() {
             list_state.select(Some(0));
         }
 
-        Self {
-            rows,
+        Ok(Self {
+            search_index,
+            total_rows,
             filtered,
             list_state,
             query: String::new(),
@@ -76,7 +78,7 @@ impl SelectorApp {
             show_help: false,
             exec_visibility,
             status: None,
-        }
+        })
     }
 
     fn selected_index(&self) -> Option<usize> {
@@ -97,12 +99,17 @@ impl SelectorApp {
     }
 
     fn refresh_filter(&mut self) {
-        self.filtered = filter_sessions_by_scope(&self.rows, &self.query, self.search_scope);
-        self.message_scroll = 0;
-        if self.filtered.is_empty() {
-            self.list_state.select(None);
-        } else {
-            self.list_state.select(Some(0));
+        match self.search_index.search(&self.query, self.search_scope) {
+            Ok(hits) => {
+                self.filtered = hits.into_iter().map(|hit| hit.row).collect();
+                self.list_state
+                    .select((!self.filtered.is_empty()).then_some(0));
+                self.message_scroll = 0;
+                self.status = None;
+            }
+            Err(error) => {
+                self.status = Some(format_search_error(&error));
+            }
         }
     }
 
@@ -166,6 +173,10 @@ impl SelectorApp {
 
     pub(crate) fn exec_visibility(&self) -> ExecVisibility {
         self.exec_visibility
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.filtered.is_empty()
     }
 
     pub(crate) fn set_exec_visibility(&mut self, visibility: ExecVisibility) {
@@ -420,7 +431,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &SelectorApp) {
         Span::styled(selected, Style::default().fg(Color::Cyan)),
         Span::raw(format!(
             " of {}{query} | exec: {}",
-            app.rows.len(),
+            app.total_rows,
             app.exec_visibility.label()
         )),
     ]);
@@ -538,6 +549,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             Span::raw(" /"),
             Span::styled(app.query.clone(), Style::default().fg(Color::Yellow)),
             Span::raw("  Tab scope  Enter accept  Esc cancel  Ctrl-C quit  Backspace delete "),
+            Span::styled(status, Style::default().fg(Color::Yellow)),
         ]),
     }
     .gray();
@@ -572,7 +584,7 @@ fn render_help(frame: &mut Frame) {
         Line::raw(""),
         Line::raw("Search"),
         Line::raw("  /               interactive search"),
-        Line::raw("  Tab             cycle all/message/cwd/branch/repo/date"),
+        Line::raw("  Tab             cycle all/message/cwd/branch/repo/date/exec"),
         Line::raw("  Enter           accept search"),
         Line::raw("  Esc             leave search/help or quit"),
         Line::raw(""),
@@ -650,25 +662,6 @@ fn scrolled_segments(segments: &[(String, Style)], scroll: usize) -> Line<'stati
     Line::from(spans)
 }
 
-fn filter_sessions_by_scope(
-    rows: &[SessionRow],
-    query: &str,
-    search_scope: SearchScope,
-) -> Vec<SessionRow> {
-    let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-    if terms.is_empty() {
-        return rows.to_vec();
-    }
-
-    rows.iter()
-        .filter(|row| {
-            let haystack = search_scope.text(row).to_lowercase();
-            terms.iter().all(|term| haystack.contains(term))
-        })
-        .cloned()
-        .collect()
-}
-
 fn resume_command(row: &SessionRow) -> Option<String> {
     row.id
         .as_deref()
@@ -697,7 +690,8 @@ impl SearchScope {
             Self::Cwd => Self::Branch,
             Self::Branch => Self::Repository,
             Self::Repository => Self::Date,
-            Self::Date => Self::All,
+            Self::Date => Self::Exec,
+            Self::Exec => Self::All,
         }
     }
 
@@ -709,27 +703,19 @@ impl SearchScope {
             Self::Branch => "branch",
             Self::Repository => "repo",
             Self::Date => "date",
+            Self::Exec => "exec",
         }
     }
+}
 
-    fn text(self, row: &SessionRow) -> String {
-        match self {
-            Self::All => [
-                row.first_message.as_str(),
-                row.cwd.as_deref().unwrap_or_default(),
-                row.repository_url.as_deref().unwrap_or_default(),
-                row.branch.as_deref().unwrap_or_default(),
-                row.timestamp.as_deref().unwrap_or_default(),
-                &session_date(row),
-            ]
-            .join("\n"),
-            Self::FirstMessage => row.first_message.clone(),
-            Self::Cwd => row.cwd.clone().unwrap_or_default(),
-            Self::Branch => row.branch.clone().unwrap_or_default(),
-            Self::Repository => row.repository_url.clone().unwrap_or_default(),
-            Self::Date => session_date(row),
-        }
+fn format_search_error(error: &anyhow::Error) -> String {
+    if let Some(query_error) = error.downcast_ref::<QueryError>() {
+        return format!("search query error: {query_error}");
     }
+    if is_corruption(error) {
+        return format!("search failed: {error}; run `select-codex-session index --rebuild`");
+    }
+    format!("search failed: {error}; refresh or rebuild the index")
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -755,6 +741,11 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        cli::IndexOptions,
+        indexer::{build_index, store::SessionView},
+        test_support::SessionFixture,
+    };
     use crossterm::event::{KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -786,6 +777,25 @@ mod tests {
         ]
     }
 
+    fn sample_app(visibility: ExecVisibility) -> (SessionFixture, SelectorApp) {
+        let fixture = SessionFixture::new();
+        fixture.write_named_session("a.jsonl", "Fix README parser", false);
+        fixture.write_named_session("b.jsonl", "add selector", false);
+        let db = fixture.path("index.sqlite3");
+        build_index(&IndexOptions {
+            output: db.clone(),
+            sessions_root: fixture.sessions_root(),
+            rebuild: false,
+            include_subsessions: false,
+            include_empty_messages: false,
+            include_exec: false,
+        })
+        .unwrap();
+        let index = SearchIndex::open(&db, SessionView::default()).unwrap();
+        let app = SelectorApp::new(index, visibility).unwrap();
+        (fixture, app)
+    }
+
     #[test]
     fn metadata_plain_uses_requested_column_order() {
         let rows = sample_rows();
@@ -797,34 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn search_scope_filters_only_selected_field() {
-        let rows = sample_rows();
-
-        assert_eq!(
-            filter_sessions_by_scope(&rows, "README", SearchScope::FirstMessage)[0].path,
-            PathBuf::from("/tmp/a.jsonl")
-        );
-        assert!(filter_sessions_by_scope(&rows, "README", SearchScope::Cwd).is_empty());
-        assert_eq!(
-            filter_sessions_by_scope(&rows, "beta", SearchScope::Cwd)[0].path,
-            PathBuf::from("/tmp/b.jsonl")
-        );
-        assert_eq!(
-            filter_sessions_by_scope(&rows, "feature", SearchScope::Branch)[0].path,
-            PathBuf::from("/tmp/b.jsonl")
-        );
-        assert_eq!(
-            filter_sessions_by_scope(&rows, "alpha.git", SearchScope::Repository)[0].path,
-            PathBuf::from("/tmp/a.jsonl")
-        );
-        assert_eq!(
-            filter_sessions_by_scope(&rows, "2026-05-28", SearchScope::Date)[0].path,
-            PathBuf::from("/tmp/b.jsonl")
-        );
-    }
-
-    #[test]
-    fn search_scope_cycles_through_all_fields() {
+    fn search_scope_cycles_through_exec() {
         let scopes = [
             SearchScope::All,
             SearchScope::FirstMessage,
@@ -832,6 +815,7 @@ mod tests {
             SearchScope::Branch,
             SearchScope::Repository,
             SearchScope::Date,
+            SearchScope::Exec,
             SearchScope::All,
         ];
 
@@ -841,19 +825,12 @@ mod tests {
     }
 
     #[test]
-    fn search_remains_case_insensitive_all_terms_substring_match() {
-        let rows = sample_rows();
-        let filtered = filter_sessions_by_scope(&rows, "FIX read", SearchScope::All);
-
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].first_message, "Fix README parser");
-    }
-
-    #[test]
-    fn exec_text_is_not_a_selector_search_scope() {
+    fn exec_scope_label_is_exec() {
         assert_eq!(SearchScope::All.next(), SearchScope::FirstMessage);
         assert_eq!(SearchScope::Repository.next(), SearchScope::Date);
-        assert_eq!(SearchScope::Date.next(), SearchScope::All);
+        assert_eq!(SearchScope::Date.next(), SearchScope::Exec);
+        assert_eq!(SearchScope::Exec.label(), "exec");
+        assert_eq!(SearchScope::Exec.next(), SearchScope::All);
     }
 
     #[test]
@@ -886,19 +863,18 @@ mod tests {
 
     #[test]
     fn selector_initial_visibility_matches_cli_state() {
-        let rows = sample_rows();
-        let hidden = SelectorApp::new(rows.clone(), ExecVisibility::Hidden);
-        let shown = SelectorApp::new(rows.clone(), ExecVisibility::Shown);
+        let (_hidden_fixture, hidden) = sample_app(ExecVisibility::Hidden);
+        let (_shown_fixture, shown) = sample_app(ExecVisibility::Shown);
 
         assert_eq!(hidden.exec_visibility(), ExecVisibility::Hidden);
         assert_eq!(shown.exec_visibility(), ExecVisibility::Shown);
-        assert_eq!(hidden.filtered.len(), rows.len());
-        assert_eq!(shown.filtered.len(), rows.len());
+        assert_eq!(hidden.filtered.len(), 2);
+        assert_eq!(shown.filtered.len(), 2);
     }
 
     #[test]
     fn selector_e_toggles_only_in_normal_mode() {
-        let mut app = SelectorApp::new(sample_rows(), ExecVisibility::Hidden);
+        let (_fixture, mut app) = sample_app(ExecVisibility::Hidden);
 
         assert_eq!(app.handle_key(key(KeyCode::Char('e'))), None);
         assert_eq!(app.exec_visibility(), ExecVisibility::Shown);
@@ -915,7 +891,7 @@ mod tests {
 
     #[test]
     fn selector_help_is_modal_for_exec_toggle() {
-        let mut app = SelectorApp::new(sample_rows(), ExecVisibility::Hidden);
+        let (_fixture, mut app) = sample_app(ExecVisibility::Hidden);
         let selected = app.selected_index();
         let focus = app.focus;
 
@@ -934,7 +910,7 @@ mod tests {
 
     #[test]
     fn selector_toggle_preserves_existing_state() {
-        let mut app = SelectorApp::new(sample_rows(), ExecVisibility::Hidden);
+        let (_fixture, mut app) = sample_app(ExecVisibility::Hidden);
         app.list_state.select(Some(1));
         app.query = "selector".to_string();
         app.search_scope = SearchScope::Branch;
@@ -942,13 +918,13 @@ mod tests {
         app.metadata_scroll = 8;
         app.message_scroll = 5;
         app.status = Some("transient error".to_string());
-        let rows = app.rows.clone();
+        let total_rows = app.total_rows;
         let filtered = app.filtered.clone();
 
         app.handle_key(key(KeyCode::Char('e')));
 
         assert_eq!(app.exec_visibility(), ExecVisibility::Shown);
-        assert_eq!(app.rows, rows);
+        assert_eq!(app.total_rows, total_rows);
         assert_eq!(app.filtered, filtered);
         assert_eq!(app.selected_index(), Some(1));
         assert_eq!(app.query, "selector");
@@ -961,7 +937,7 @@ mod tests {
 
     #[test]
     fn selector_toggle_is_safe_with_empty_search_result() {
-        let mut app = SelectorApp::new(sample_rows(), ExecVisibility::Hidden);
+        let (_fixture, mut app) = sample_app(ExecVisibility::Hidden);
         app.query = "definitely-not-present".to_string();
         app.refresh_filter();
         app.mode = Mode::Normal;
@@ -971,5 +947,54 @@ mod tests {
         assert!(app.filtered.is_empty());
         assert_eq!(app.selected_index(), None);
         assert_eq!(app.exec_visibility(), ExecVisibility::Shown);
+    }
+
+    #[test]
+    fn query_error_preserves_previous_results_and_selection() {
+        let (_fixture, mut app) = sample_app(ExecVisibility::Hidden);
+        app.query = "fix".to_owned();
+        app.refresh_filter();
+        let filtered = app.filtered.clone();
+        let selected = app.selected_index();
+        app.message_scroll = 7;
+
+        app.query = "---".to_owned();
+        app.refresh_filter();
+
+        assert_eq!(app.filtered, filtered);
+        assert_eq!(app.selected_index(), selected);
+        assert_eq!(app.message_scroll, 7);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("search query error: query contains no searchable token")
+        );
+    }
+
+    #[test]
+    fn database_error_preserves_previous_results_and_selection() {
+        let (fixture, mut app) = sample_app(ExecVisibility::Hidden);
+        let filtered = app.filtered.clone();
+        let selected = app.selected_index();
+        app.message_scroll = 4;
+        let conn = rusqlite::Connection::open(fixture.path("index.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE sessions SET first_message = first_message || ' external'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        app.query = "fix".to_owned();
+        app.refresh_filter();
+
+        assert_eq!(app.filtered, filtered);
+        assert_eq!(app.selected_index(), selected);
+        assert_eq!(app.message_scroll, 4);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .starts_with("search failed: FTS index is dirty")
+        );
     }
 }

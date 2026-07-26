@@ -109,7 +109,7 @@ fn index_help_lists_legacy_recorder_options() {
 }
 
 #[test]
-fn index_fresh_build_reports_rebuilt_canonical_summary() {
+fn index_creates_schema_v2_with_fts() {
     let fixture = Fixture::new();
     fixture.write_session("normal.jsonl", "증분 인덱스 확인");
     let output = stdout(fixture.index().output().unwrap());
@@ -122,6 +122,12 @@ fn index_fresh_build_reports_rebuilt_canonical_summary() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
+        2
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM sessions_fts", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
         1
     );
     assert_eq!(
@@ -131,6 +137,41 @@ fn index_fresh_build_reports_rebuilt_canonical_summary() {
         .unwrap(),
         0
     );
+}
+
+#[test]
+fn selector_no_refresh_rejects_schema_v1_with_action() {
+    let fixture = Fixture::new();
+    fixture.write_session("normal.jsonl", "message");
+    stdout(fixture.index().output().unwrap());
+    let conn = Connection::open(&fixture.db).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER sessions_fts_dirty_ai;
+         DROP TRIGGER sessions_fts_dirty_au;
+         DROP TRIGGER sessions_fts_dirty_ad;
+         DROP TRIGGER exec_events_fts_dirty_ai;
+         DROP TRIGGER exec_events_fts_dirty_au;
+         DROP TRIGGER exec_events_fts_dirty_ad;
+         DROP TABLE sessions_fts;
+         DROP TABLE fts_sync_state;
+         PRAGMA user_version = 1;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let output = Command::new(binary())
+        .args([
+            "--no-refresh",
+            "--db",
+            fixture.db.to_str().unwrap(),
+            "--print-path",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains(
+        "search index schema 2 is required; refresh the index or run `select-codex-session index`"
+    ));
 }
 
 #[test]

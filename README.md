@@ -105,16 +105,30 @@ An override value is treated as one executable path, not as a shell command.
 - `h/l` or `Left/Right`: horizontally scroll session metadata
 - `0`: reset horizontal scroll
 - `/`: interactive search
-- `Tab` while searching: cycle `all`, `message`, `cwd`, `branch`, `repo`, `date`
+- `Tab` while searching: cycle `all`, `message`, `cwd`, `branch`, `repo`, `date`, `exec`
 - `e`: toggle exec visibility for the next replay
 - `Enter`: replay the selected session, then return to the selector
 - `y`: copy `codex resume <session-id>` to the clipboard
 - `?`: show help
 - `q`, `Esc`, or `Ctrl-C`: quit
 
-Search is case-insensitive substring matching. All whitespace-separated terms
-must match the selected scope. While searching, `e` is entered as query text
-instead of toggling visibility.
+Search uses the persistent FTS5 index and BM25 relevance. Bare
+whitespace-separated terms are combined with AND and match token prefixes:
+`fix read` finds “Fix README parser”, while the middle substring `ead` does not.
+Double quotes select an exact token phrase, and a whitespace-delimited `|`
+separates OR groups:
+
+```text
+"readme parser" | cargo test
+```
+
+The scopes search all indexed fields, the first message, cwd, branch,
+repository URL, date, or command/output text respectively. FTS uses the
+Unicode `unicode61` tokenizer. A Korean word without spaces is one token, so
+`검색` finds `검색기능`, but the middle of that token (`기능`) does not.
+While searching, `e` is entered as query text instead of toggling visibility.
+Exec command and output are always searchable in `all` and `exec`; the
+`exec: shown|hidden` state only controls the next replay.
 
 An internal replay returns its final exec visibility to the selector, so the
 next replay starts in the same state. An external `--replay-command` receives
@@ -215,17 +229,20 @@ codex-replay-tui ARGS           → select-codex-session replay ARGS
 
 Upgrading does not automatically delete previously installed standalone
 executables. Remove old copies manually after confirming their install path.
-An existing seven-column legacy database remains readable with `--no-refresh`.
-The next refresh transactionally rebuilds it from source JSONL into the
-canonical schema. Changing `--sessions-root` for an existing canonical database
-also causes an automatic full rebuild. A newer schema version is never
-overwritten; an unknown schema requires explicit `index --rebuild`.
+The next refresh transactionally rebuilds an existing seven-column legacy
+database from source JSONL. Schema v1 canonical indexes migrate in place to
+schema v2 without reparsing unchanged JSONL. `--no-refresh` requires schema v2;
+for an older index, refresh normally or run `select-codex-session index`.
+Changing `--sessions-root` for an existing canonical database also causes an
+automatic full rebuild. A newer schema version is never overwritten; an
+unknown schema requires explicit `index --rebuild`.
 
 ## SQLite schema
 
 The crate uses `rusqlite 0.40.1` with bundled SQLite `3.53.2`.
 
-The index uses `PRAGMA user_version = 1` and contains four STRICT tables:
+The index uses `PRAGMA user_version = 2`. Its canonical data remains in four
+STRICT tables:
 
 ```text
 index_metadata(singleton, sessions_root)
@@ -253,9 +270,21 @@ transaction and validate foreign keys and SQLite integrity before commit.
 `sessions` and `exec_events` always exist. Replay still reads JSONL directly;
 the TUI `e` toggle only changes the in-memory replay view.
 
-FTS5 search tables are intentionally not part of this schema yet. Selector
-search remains the existing in-memory, case-insensitive all-term substring
-match.
+Each canonical session also has one Contentless-Delete FTS5 document whose
+`sessions_fts.rowid` is the stable `sessions.session_key`. It indexes the first
+message, cwd, repository URL, branch, timestamp/date, and newline-joined exec
+commands and outputs. The virtual table uses `unicode61 remove_diacritics 2`,
+2/3-character prefix indexes, full phrase detail, and BM25 column sizes.
+
+`fts_sync_state` and six mutation triggers detect canonical writes made outside
+the indexer. A normal incremental refresh updates only touched FTS documents.
+If the dirty state or FTS/canonical rowid sets disagree, the next refresh
+rebuilds only the FTS objects while preserving canonical keys. For FTS shadow
+corruption, use:
+
+```bash
+select-codex-session index --rebuild
+```
 
 ## Development
 

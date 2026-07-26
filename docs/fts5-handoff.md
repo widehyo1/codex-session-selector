@@ -2,7 +2,7 @@
 
 ## 1. 문서 상태와 목적
 
-- 상태: 구현 전 실행 handoff
+- 상태: 구현 완료 handoff
 - 대상 기능: 3번 FTS5 검색 강화
 - 상세 설계 source of truth:
   [`fts5-implementation-plan.md`](./fts5-implementation-plan.md)
@@ -1149,9 +1149,25 @@ corpus seed/size
 
 | corpus | canonical-only size/time | FTS size/time | incremental | query median | query p95 |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1k | pending | pending | pending | pending | pending |
-| 10k | pending | pending | pending | pending | pending |
-| 50k | pending | pending | pending | pending | pending |
+| 1k | 7,016,448 B / 164.91 ms | 9,007,104 B / 1.27 s | 122.46 ms | 0.146 ms | 0.919 ms |
+| 10k | 70,021,120 B / 760.95 ms | 90,419,200 B / 9.54 s | 1.03 s | 1.14 ms | 9.46 ms |
+| 50k | 350,289,920 B / 5.24 s | 449,662,976 B / 58.94 s | 6.56 s | 5.45 ms | 92.34 ms |
+
+실행 환경:
+
+```text
+date/timezone: 2026-07-27 Asia/Seoul
+commit: 601278bcf2efea4c0426ffbd9f6511d376534cb7 + uncommitted implementation diff
+rustc: 1.97.1 (8bab26f4f 2026-07-14)
+rusqlite/libsqlite3-sys: 0.40.1 / 0.38.1
+SQLite: 3.53.2, ENABLE_FTS5
+CPU: Intel Core i7-8665U @ 1.90GHz
+profile/seed: release / 0x5eed
+```
+
+10k/50k p95, 10k incremental/full-build ratio, 3.0x DB size와 반복 result
+path/order gate가 모두 통과했다. 50k incremental/full-build 비율은 약 11.1%,
+FTS/canonical-only 크기 비율은 약 1.28배다.
 
 gate:
 
@@ -1173,16 +1189,16 @@ exec output 비중을 측정하고 제품/schema 결정을 바꿔야 하면 사�
 
 | 항목 | 결과 | 비고 |
 | --- | --- | --- |
-| `read` README match | pending | |
-| `ead` non-match | pending | |
-| phrase/OR | pending | |
-| scope `exec` 순환 | pending | |
-| command search | pending | |
-| output search | pending | |
-| visibility independence | pending | |
-| replay round-trip state | pending | |
-| dirty external write error/refresh | pending | |
-| key preservation | pending | |
+| `read` README match | pass | automated FTS fixture |
+| `ead` non-match | pass | automated FTS fixture |
+| phrase/OR | pass | automated query + search fixture |
+| scope `exec` 순환 | pass | tmux pseudo-terminal, footer `search: exec` |
+| command search | pass | tmux pseudo-terminal, `pwd` returned 1/1 |
+| output search | pass | automated Korean/exec fixture |
+| visibility independence | pass | tmux: hidden→shown kept `/pwd` and 1/1 |
+| replay round-trip state | pass | replay quit returned with `/pwd`, exec scope result and shown state |
+| dirty external write error/refresh | pass | selector state + FTS-only repair tests |
+| key preservation | pass | dirty repair test preserves `session_key` |
 
 자동 test로 대체할 수 없는 TUI 항목은 실제 pseudo-terminal에서 확인한다.
 
@@ -1272,13 +1288,13 @@ baseline”으로 만들기 위해 문서를 삭제하거나 자동 commit하지
 
 | Phase | 상태 | commit | 대상 test | 전체 gate | 비고 |
 | --- | --- | --- | --- | --- | --- |
-| 0 baseline | pending | - | pending | baseline pass | |
-| 1 schema/migration | pending | - | pending | pending | |
-| 2 document/sync | pending | - | pending | pending | |
-| 3 health/repair | pending | - | pending | pending | |
-| 4 query/search | pending | - | pending | pending | |
-| 5 selector | pending | - | pending | pending | |
-| 6 benchmark/docs | pending | - | pending | pending | |
+| 0 baseline | complete | not requested | baseline 74 pass/1 ignored + CLI 9 pass | pass | worktree clean |
+| 1 schema/migration | complete | not requested | v2 exact schema, runtime, v1 parse-0 migration | pass | `user_version=2` |
+| 2 document/sync | complete | not requested | population and session/exec delta replacement | pass | canonical/FTS one transaction |
+| 3 health/repair | complete | not requested | dirty/missing/extra/corruption recovery | pass | canonical keys preserved |
+| 4 query/search | complete | not requested | grammar, scopes, fixtures, BM25/tie-break | pass | read-only persistent connection |
+| 5 selector | complete | not requested | exec scope, error preservation, visibility | pass | production memory scan removed |
+| 6 benchmark/docs | complete | not requested | release benchmark and pseudo-terminal smoke | pass | README/handoff current |
 
 commit하지 않는 workflow라면 commit column에 `not requested`를 적고 diff
 scope를 기록한다.
@@ -1317,69 +1333,75 @@ scope를 기록한다.
 ### 23.1 변경
 
 ```text
-새 module/file:
-변경 production file:
-변경 test/fixture:
-README/help:
-사용자-visible behavior:
+새 module/file: src/indexer/fts.rs, src/indexer/search.rs,
+  tests/fts_benchmark.rs, scripts/benchmark-fts.sh
+변경 production file: src/indexer.rs, src/indexer/schema.rs,
+  src/application.rs, src/selector/mod.rs
+변경 test/fixture: schema/index/search/selector unit와 tests/cli.rs
+README/help: FTS 문법, exec scope, schema v2, migration/repair 설명
+사용자-visible behavior: token-prefix/phrase/OR scoped BM25 search,
+  exec command/output search, interactive error status
 ```
 
 ### 23.2 schema/migration
 
 ```text
-SQLite runtime:
-user_version:
-FTS DDL/object:
-v1 migration parse count:
-root change:
-forced rebuild:
-rollback:
+SQLite runtime: bundled 3.53.2, ENABLE_FTS5 확인
+user_version: 2
+FTS DDL/object: contentless-delete sessions_fts, 4 shadow table,
+  fts_sync_state, 6 dirty trigger
+v1 migration parse count: unchanged fixture parsed_files=0
+root change: canonical+FTS rebuild
+forced rebuild: canonical+FTS recreate + integrity-check
+rollback: 기존 immediate transaction rollback 계약 유지
 ```
 
 ### 23.3 incremental/repair
 
 ```text
-no-op FTS writes:
-session insert/update/delete:
-exec insert/update/delete:
-dirty repair:
-rowid repair:
-corruption recovery:
-key preservation:
+no-op FTS writes: unchanged delta는 document DML/dirty transition 없음
+session insert/update/delete: touched/deleted stable rowid 동기화
+exec insert/update/delete: event_index aggregate document 전체 교체
+dirty repair: 다음 incremental index에서 FTS-only rebuild
+rowid repair: missing/extra 모두 FTS-only rebuild
+corruption recovery: query/open 오류 후 index --rebuild test 통과
+key preservation: FTS-only repair 전후 session_key 유지
 ```
 
 ### 23.4 query/selector
 
 ```text
-grammar:
-scope:
-ranking:
-Korean/path/URL:
-command/output:
-visibility:
-error state:
+grammar: whitespace AND prefix, quoted phrase, spaced-pipe OR,
+  unclosed quote 허용, raw operator quote escape
+scope: all/message/cwd/branch/repo/date/exec
+ranking: bm25(10,4,4,5,2,2,1.5,0.25), timestamp/session_key tie-break
+Korean/path/URL: prefix/boundary와 component fixture pass
+command/output: exec scope 및 all cross-column fixture pass
+visibility: search result와 독립
+error state: 직전 result/selection/scroll 보존, footer status 표시
 ```
 
 ### 23.5 검증
 
 ```text
-phase red 원인:
-unit/integration count:
-fmt:
-clippy:
-release build:
-diff check:
-benchmark:
-manual smoke:
-local install/version:
+phase red 원인: 기존 schema v1 assertion, 초기 50k all-result benchmark query
+unit/integration count: library 96 pass/1 ignored, CLI 10 pass,
+  benchmark 1 ignored in normal gate
+fmt: pass
+clippy: pass (-D warnings)
+release build: pass
+diff check: pass
+benchmark: pass; 10k p95 9.46ms, 50k p95 92.34ms
+manual smoke: pseudo-terminal exec scope/search/toggle/replay return pass
+local install/version: pass, single binary 0.3.0
 ```
 
 ### 23.6 공개 정책
 
 ```text
-package version 0.3.0 유지:
-dependency/Rust minimum 유지:
-publish/tag/release 없음:
+package version 0.3.0 유지: yes
+dependency/Rust minimum 유지: yes; Cargo.lock unchanged, Rust 1.97
+publish/tag/release 없음: yes
 ```
 
 ## 24. 구현 세션에 전달할 시작 지시
