@@ -375,7 +375,13 @@ fn apply_message_diff(
     let mut existing = BTreeMap::new();
     for row in stmt.query_map(params![session_key], |row| {
         Ok((
-            usize::try_from(row.get::<_, i64>(1)?).unwrap(),
+            usize::try_from(row.get::<_, i64>(1)?).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?,
             row.get::<_, MessageKey>(0)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
@@ -636,6 +642,9 @@ pub(crate) fn normalize_delta(delta: &mut IndexDelta) {
     normalize(&mut delta.inserted_exec_keys);
     normalize(&mut delta.updated_exec_keys);
     normalize(&mut delta.deleted_exec_keys);
+    normalize(&mut delta.inserted_message_keys);
+    normalize(&mut delta.updated_message_keys);
+    normalize(&mut delta.deleted_message_keys);
     normalize(&mut delta.touched_session_keys);
 }
 

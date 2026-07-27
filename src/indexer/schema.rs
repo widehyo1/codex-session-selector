@@ -294,10 +294,60 @@ fn validate_v2(conn: &Connection, tables: &BTreeSet<String>) -> Result<()> {
 
     validate_canonical_tables(conn)?;
     validate_fts_state(conn)?;
-    // v2 is accepted only as a migration source. Its old eight-column FTS
-    // layout deliberately differs from the current content-only layout.
-    if !tables.contains("sessions_fts") {
-        bail!("schema v2 is missing sessions_fts");
+    validate_v2_fts(conn)?;
+    Ok(())
+}
+
+fn validate_v2_fts(conn: &Connection) -> Result<()> {
+    let expected = [
+        "first_message",
+        "cwd",
+        "repository_url",
+        "branch",
+        "timestamp",
+        "date",
+        "exec_command",
+        "exec_output",
+    ];
+    let actual = columns(conn, "sessions_fts")?
+        .into_iter()
+        .map(|column| column.name)
+        .collect::<Vec<_>>();
+    if actual != expected {
+        bail!("sessions_fts columns do not match schema v2");
+    }
+    let ddl = conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'sessions_fts'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+    let normalized = normalize_sql(&ddl);
+    for required in [
+        "content=''",
+        "contentless_delete=1",
+        "tokenize='unicode61 remove_diacritics 2'",
+        "prefix='2 3'",
+        "detail=full",
+        "columnsize=1",
+    ] {
+        if !normalized.contains(required) {
+            bail!("sessions_fts DDL does not match schema v2");
+        }
+    }
+    let names = conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%' ORDER BY name")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected_names = [
+        "exec_events_fts_dirty_ad",
+        "exec_events_fts_dirty_ai",
+        "exec_events_fts_dirty_au",
+        "sessions_fts_dirty_ad",
+        "sessions_fts_dirty_ai",
+        "sessions_fts_dirty_au",
+    ];
+    if names != expected_names {
+        bail!("schema v2 dirty trigger set does not match");
     }
     Ok(())
 }

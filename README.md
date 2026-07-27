@@ -126,12 +126,14 @@ separates OR groups:
 "readme parser" | cargo test
 ```
 
-The scopes search all indexed fields, the first message, cwd, branch,
-repository URL, date, or command/output text respectively. FTS uses the
+Content targets are `content:all`, `content:user`, `content:agent`, and
+`content:exec`; the selector starts on `metadata` and first enters content at
+`content:all`. The right pane always shows the first message, not a matched
+content preview. FTS uses the
 Unicode `unicode61` tokenizer. A Korean word without spaces is one token, so
 `검색` finds `검색기능`, but the middle of that token (`기능`) does not.
 While searching, `e` is entered as query text instead of toggling visibility.
-Exec command and output are always searchable in `all` and `exec`; the
+Exec command and output are always searchable in `content:all` and `content:exec`; the
 `exec: shown|hidden` state only controls the next replay.
 
 An internal replay returns its final exec visibility to the selector, so the
@@ -269,7 +271,7 @@ message_events(event_index, role, content, message_key, session_key)
 that source; `exec_key` and `message_key` are stable for the same session and JSONL
 `event_index` across incremental updates. File rename, root change, legacy
 migration, and forced rebuild may assign new keys. Foreign keys cascade source
-deletions through sessions and exec events.
+deletions through sessions, exec events, and message events.
 
 All writes, including legacy migration and full rebuild, use one immediate
 transaction and validate foreign keys and SQLite integrity before commit.

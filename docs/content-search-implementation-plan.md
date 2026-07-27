@@ -4,7 +4,7 @@
 
 - 상태: 구현 준비 완료
 - 대상 기능: selector 메타 검색과 대화 콘텐츠 FTS 검색 분리
-- 목표 package version: `0.4.0`
+- 목표 package version: `0.3.0`
 - 목표 index schema version: `3`
 - 기준 commit: `cccee9b` (`fix: align tui paging and end scroll`)
 - 선행 schema:
@@ -1200,7 +1200,7 @@ git diff --check
 ### Phase 2. benchmark, package와 문서
 
 1. benchmark corpus를 multi-message schema v3 데이터로 갱신한다.
-2. package version을 `0.4.0`으로 갱신하고 lockfile을 반영한다.
+2. package version을 `0.3.0`으로 갱신하고 lockfile을 반영한다.
 3. README, CLI help, TUI help와 schema 설명을 갱신한다.
 4. `content-search-handoff.md`에 실제 commit, test, benchmark 결과를 기록한다.
 5. manual tmux smoke를 수행한다.
@@ -1516,7 +1516,7 @@ tmux -L codex-session-selector-content-search kill-server
 
 ### 15.1 package
 
-- `Cargo.toml`: `0.3.0` → `0.4.0`
+- `Cargo.toml`: `0.2.0` → `0.3.0`
 - `Cargo.lock`: package version 동기화
 - dependency와 feature 변경 없음
 - Rust minimum `1.97` 유지
@@ -1590,7 +1590,7 @@ search: content:all /<query>
 9. selector가 matched content preview/highlight를 표시하지 않는다.
 10. dirty/row identity mismatch가 다음 refresh에서 content FTS-only repair된다.
 11. README, CLI help, TUI help와 schema 설명이 실제 구현과 일치한다.
-12. package version이 `0.4.0`, schema version이 `3`이다.
+12. package version이 `0.3.0`, schema version이 `3`이다.
 13. 다음 명령이 모두 exit `0`이다.
 
     ```bash

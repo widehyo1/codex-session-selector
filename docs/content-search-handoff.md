@@ -2,30 +2,29 @@
 
 ## 구현 진행 기록
 
-- schema/package: v3 / 0.4.0으로 갱신했다.
+- schema/package: v3 / 0.3.0으로 갱신했다.
 - canonical `message_events`와 역할별 content FTS 문서를 추가했다.
 - selector는 metadata 및 content:all/user/agent/exec target을 Tab으로 순환한다.
 - v1/v2 index는 refresh 시 source를 다시 읽어 v3으로 마이그레이션한다.
 - v2 전용 unit/CLI/benchmark fixture와 assertion을 v3 계약에 맞춰 갱신했다.
+- 구현 commit: `ff77cfa`.
 - 검증: `cargo test --all-targets --all-features`, `cargo build --release`,
   `bash scripts/benchmark-fts.sh`, `cargo clippy --all-targets --all-features -- -D warnings` 통과.
 
 ## 1. 문서 상태와 목적
 
-- 상태: 구현 대기 handoff
+- 상태: 구현 완료 handoff
 - 대상 기능: selector 메타 검색과 대화 콘텐츠 FTS 검색 분리
 - 상세 설계 source of truth:
   [`content-search-implementation-plan.md`](./content-search-implementation-plan.md)
 - production 기준 commit: `cccee9b`
 - 시작 package version: `0.3.0`
-- 목표 package version: `0.4.0`
+- 목표 package version: `0.3.0`
 - 시작 index schema version: `2`
 - 목표 index schema version: `3`
 
-이 문서는 다음 구현 세션이 저장소 탐색과 이미 끝난 제품·schema 판단을
-반복하지 않고 계획을 실행하기 위한 작업 지시서다. exact DDL, type/function
-signature, pseudocode, test 이름, benchmark threshold와 완료 조건은 계획
-문서가 우선한다.
+이 문서는 구현 결과와 후속 점검을 위한 handoff다. exact DDL, type/function
+signature, pseudocode, test 이름, benchmark threshold와 완료 조건은 계획 문서가 우선한다.
 
 구현 세션은 production code를 바꾸기 전에 계획 문서 1~17절을 처음부터
 끝까지 읽는다. 이 handoff만 읽거나 일부 계획 section만 발췌해 구현하지
@@ -700,7 +699,7 @@ feat: split metadata and content session search
 ### Phase 2. benchmark, package, docs와 handoff 완료
 
 1. benchmark corpus와 v2 migration fixture를 계획대로 갱신한다.
-2. `Cargo.toml` package version을 `0.4.0`으로 올린다.
+2. `Cargo.toml` package version을 `0.3.0`으로 유지한다.
 3. Cargo 명령으로 `Cargo.lock` local package version을 동기화한다.
 4. README, root CLI help와 TUI help를 갱신한다.
 5. release benchmark를 실행한다.
@@ -894,7 +893,7 @@ tmux -L codex-session-selector-content-search kill-server
 15. invalid content query 때 filtered/selection/scroll을 reset하지 않는다.
 16. search target 전환 성공 때 selection reset 계약을 빼먹지 않는다.
 17. preview를 위해 JSONL을 selector에서 다시 열지 않는다.
-18. package `0.4.0` 변경을 Phase 1 code commit에 섞지 않는다.
+18. package `0.3.0` 변경을 별도 release commit에서 확인한다.
 
 ## 13. 중단하고 보고할 조건
 
