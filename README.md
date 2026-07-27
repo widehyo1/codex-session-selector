@@ -105,7 +105,7 @@ An override value is treated as one executable path, not as a shell command.
 - `h/l` or `Left/Right`: horizontally scroll session metadata
 - `0`: reset horizontal scroll
 - `/`: interactive search
-- `Tab` while searching: cycle `all`, `message`, `cwd`, `branch`, `repo`, `date`, `exec`
+- `Tab` while searching: cycle `metadata`, `content:all`, `content:user`, `content:agent`, `content:exec`
 - `e`: toggle exec visibility for the next replay
 - `Enter`: replay the selected session, then return to the selector
 - `y`: copy `codex resume <session-id>` to the clipboard
@@ -113,7 +113,10 @@ An override value is treated as one executable path, not as a shell command.
 - `q` or `Ctrl-C`: quit
 - `Esc`: quit normally; leave search or help when open
 
-Search uses the persistent FTS5 index and BM25 relevance. Bare
+Metadata search uses case-insensitive all-term substring matching over the first
+message, cwd, repository URL, branch, timestamp, and date. Content search uses
+the persistent FTS5 index and BM25 relevance over user messages, agent messages,
+and exec commands/output. Bare
 whitespace-separated terms are combined with AND and match token prefixes:
 `fix read` finds “Fix README parser”, while the middle substring `ead` does not.
 Double quotes select an exact token phrase, and a whitespace-delimited `|`
@@ -232,8 +235,8 @@ codex-replay-tui ARGS           → select-codex-session replay ARGS
 Upgrading does not automatically delete previously installed standalone
 executables. Remove old copies manually after confirming their install path.
 The next refresh transactionally rebuilds an existing seven-column legacy
-database from source JSONL. Schema v1 canonical indexes migrate in place to
-schema v2 without reparsing unchanged JSONL. `--no-refresh` requires schema v2;
+database from source JSONL. Schema v1 and v2 canonical indexes migrate in place
+to schema v3 by reparsing their stable source JSONL files. `--no-refresh` requires schema v3;
 for an older index, refresh normally or run `select-codex-session index`.
 Changing `--sessions-root` for an existing canonical database also causes an
 automatic full rebuild. A newer schema version is never overwritten; an
@@ -243,7 +246,7 @@ unknown schema requires explicit `index --rebuild`.
 
 The crate uses `rusqlite 0.40.1` with bundled SQLite `3.53.2`.
 
-The index uses `PRAGMA user_version = 2`. Its canonical data remains in four
+The index uses `PRAGMA user_version = 3`. Its canonical data uses five
 STRICT tables:
 
 ```text
@@ -259,26 +262,27 @@ exec_events(
   session_path, session_id, event_index, call_id,
   kind, name, command, output, exec_key, session_key
 )
+message_events(event_index, role, content, message_key, session_key)
 ```
 
 `source_key` is stable for an unchanged source path, `session_key` is stable for
-that source, and `exec_key` is stable for the same session and JSONL
+that source; `exec_key` and `message_key` are stable for the same session and JSONL
 `event_index` across incremental updates. File rename, root change, legacy
 migration, and forced rebuild may assign new keys. Foreign keys cascade source
 deletions through sessions and exec events.
 
 All writes, including legacy migration and full rebuild, use one immediate
 transaction and validate foreign keys and SQLite integrity before commit.
-`sessions` and `exec_events` always exist. Replay still reads JSONL directly;
+`sessions`, `exec_events`, and `message_events` always exist. Replay still reads JSONL directly;
 the TUI `e` toggle only changes the in-memory replay view.
 
 Each canonical session also has one Contentless-Delete FTS5 document whose
-`sessions_fts.rowid` is the stable `sessions.session_key`. It indexes the first
-message, cwd, repository URL, branch, timestamp/date, and newline-joined exec
-commands and outputs. The virtual table uses `unicode61 remove_diacritics 2`,
+`sessions_fts.rowid` is the stable `sessions.session_key`. It indexes newline-joined
+user messages, agent messages, exec commands, and exec outputs; metadata remains
+an in-memory substring search. The virtual table uses `unicode61 remove_diacritics 2`,
 2/3-character prefix indexes, full phrase detail, and BM25 column sizes.
 
-`fts_sync_state` and six mutation triggers detect canonical writes made outside
+`fts_sync_state` and nine mutation triggers detect canonical writes made outside
 the indexer. A normal incremental refresh updates only touched FTS documents.
 If the dirty state or FTS/canonical rowid sets disagree, the next refresh
 rebuilds only the FTS objects while preserving canonical keys. For FTS shadow

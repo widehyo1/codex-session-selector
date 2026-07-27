@@ -8,8 +8,9 @@ use rusqlite::{Connection, Transaction, params};
 
 use super::fts;
 
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 const CANONICAL_V1_VERSION: i64 = 1;
+const FTS_V2_VERSION: i64 = 2;
 
 pub(crate) const TABLE_DDL: &str = r#"
 CREATE TABLE index_metadata (
@@ -60,6 +61,16 @@ CREATE TABLE exec_events (
         REFERENCES sessions(session_key) ON DELETE CASCADE,
     UNIQUE (session_key, event_index)
 ) STRICT;
+
+CREATE TABLE message_events (
+    event_index INTEGER NOT NULL CHECK (event_index >= 0),
+    role TEXT NOT NULL CHECK (role IN ('user', 'agent')),
+    content TEXT NOT NULL,
+    message_key INTEGER PRIMARY KEY,
+    session_key INTEGER NOT NULL
+        REFERENCES sessions(session_key) ON DELETE CASCADE,
+    UNIQUE (session_key, event_index)
+) STRICT;
 "#;
 
 pub(crate) const INDEX_DDL: &str = r#"
@@ -74,6 +85,7 @@ pub(crate) enum SchemaState {
     Empty,
     Legacy,
     CanonicalV1 { sessions_root: PathBuf },
+    FtsV2 { sessions_root: PathBuf },
     Current { sessions_root: PathBuf },
     Future { version: i64 },
     Unknown { version: i64, reason: String },
@@ -102,6 +114,7 @@ pub(crate) fn detect_schema(conn: &Connection) -> Result<SchemaState> {
     }
     let validation = match version {
         CANONICAL_V1_VERSION => validate_v1(conn, &tables).and_then(|()| current_root(conn)),
+        FTS_V2_VERSION => validate_v2(conn, &tables).and_then(|()| current_root(conn)),
         SCHEMA_VERSION => validate_current(conn, &tables).and_then(|()| current_root(conn)),
         _ => {
             return Ok(SchemaState::Unknown {
@@ -114,6 +127,7 @@ pub(crate) fn detect_schema(conn: &Connection) -> Result<SchemaState> {
         Ok(sessions_root) if version == CANONICAL_V1_VERSION => {
             Ok(SchemaState::CanonicalV1 { sessions_root })
         }
+        Ok(sessions_root) if version == FTS_V2_VERSION => Ok(SchemaState::FtsV2 { sessions_root }),
         Ok(sessions_root) => Ok(SchemaState::Current { sessions_root }),
         Err(error) => Ok(SchemaState::Unknown {
             version,
@@ -252,7 +266,7 @@ fn validate_v1(conn: &Connection, tables: &BTreeSet<String>) -> Result<()> {
     validate_canonical_tables(conn)
 }
 
-fn validate_current(conn: &Connection, tables: &BTreeSet<String>) -> Result<()> {
+fn validate_v2(conn: &Connection, tables: &BTreeSet<String>) -> Result<()> {
     let expected_tables = BTreeSet::from([
         "exec_events".to_owned(),
         "fts_sync_state".to_owned(),
@@ -279,6 +293,69 @@ fn validate_current(conn: &Connection, tables: &BTreeSet<String>) -> Result<()> 
     }
 
     validate_canonical_tables(conn)?;
+    validate_fts_state(conn)?;
+    // v2 is accepted only as a migration source. Its old eight-column FTS
+    // layout deliberately differs from the current content-only layout.
+    if !tables.contains("sessions_fts") {
+        bail!("schema v2 is missing sessions_fts");
+    }
+    Ok(())
+}
+
+fn validate_current(conn: &Connection, tables: &BTreeSet<String>) -> Result<()> {
+    let mut expected = BTreeSet::from([
+        "exec_events".to_owned(),
+        "fts_sync_state".to_owned(),
+        "index_metadata".to_owned(),
+        "message_events".to_owned(),
+        "sessions".to_owned(),
+        "sessions_fts".to_owned(),
+        "sessions_fts_config".to_owned(),
+        "sessions_fts_data".to_owned(),
+        "sessions_fts_docsize".to_owned(),
+        "sessions_fts_idx".to_owned(),
+        "source_files".to_owned(),
+    ]);
+    if tables != &expected {
+        bail!("schema v3 table set does not match the required schema");
+    }
+    expected.clear();
+    validate_canonical_tables(conn)?;
+    if columns(conn, "message_events")?
+        != expected_columns(&[
+            ("event_index", "INTEGER", true, 0),
+            ("role", "TEXT", true, 0),
+            ("content", "TEXT", true, 0),
+            ("message_key", "INTEGER", false, 1),
+            ("session_key", "INTEGER", true, 0),
+        ])
+    {
+        bail!("message_events columns do not match schema v3");
+    }
+    let strict = conn.query_row(
+        "SELECT strict FROM pragma_table_list WHERE name = 'message_events'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if strict != 1 {
+        bail!("message_events is not STRICT");
+    }
+    let message_sql = conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'message_events'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+    if !normalize_sql(&message_sql).contains("CHECK (role IN ('user', 'agent'))") {
+        bail!("message_events role CHECK does not match schema v3");
+    }
+    require_unique(conn, "message_events", &["session_key", "event_index"])?;
+    require_foreign_key(
+        conn,
+        "message_events",
+        "session_key",
+        "sessions",
+        "session_key",
+    )?;
     validate_fts_state(conn)?;
     validate_fts_table(conn)?;
     validate_fts_triggers(conn)?;
@@ -401,12 +478,8 @@ fn validate_fts_state(conn: &Connection) -> Result<()> {
 
 fn validate_fts_table(conn: &Connection) -> Result<()> {
     let expected_names = [
-        "first_message",
-        "cwd",
-        "repository_url",
-        "branch",
-        "timestamp",
-        "date",
+        "user_content",
+        "agent_content",
         "exec_command",
         "exec_output",
     ];
@@ -415,7 +488,7 @@ fn validate_fts_table(conn: &Connection) -> Result<()> {
         .map(|column| column.name)
         .collect::<Vec<_>>();
     if actual_names != expected_names {
-        bail!("sessions_fts columns do not match schema v2");
+        bail!("sessions_fts columns do not match schema v3");
     }
     let sql = conn.query_row(
         "SELECT sql FROM sqlite_schema
@@ -430,7 +503,7 @@ fn validate_fts_table(conn: &Connection) -> Result<()> {
         .and_then(|statement| statement.split(';').next().map(str::to_owned))
         .context("invalid built-in FTS DDL")?;
     if normalize_sql(&sql) != normalize_sql(&expected) {
-        bail!("sessions_fts DDL does not match schema v2");
+        bail!("sessions_fts DDL does not match schema v3");
     }
     Ok(())
 }
@@ -461,6 +534,18 @@ fn validate_fts_triggers(conn: &Connection) -> Result<()> {
             "exec_events_fts_dirty_ad",
             "CREATE TRIGGER exec_events_fts_dirty_ad AFTER DELETE ON exec_events BEGIN UPDATE fts_sync_state SET dirty = 1 WHERE singleton = 1; END",
         ),
+        (
+            "message_events_fts_dirty_ai",
+            "CREATE TRIGGER message_events_fts_dirty_ai AFTER INSERT ON message_events BEGIN UPDATE fts_sync_state SET dirty = 1 WHERE singleton = 1; END",
+        ),
+        (
+            "message_events_fts_dirty_au",
+            "CREATE TRIGGER message_events_fts_dirty_au AFTER UPDATE ON message_events BEGIN UPDATE fts_sync_state SET dirty = 1 WHERE singleton = 1; END",
+        ),
+        (
+            "message_events_fts_dirty_ad",
+            "CREATE TRIGGER message_events_fts_dirty_ad AFTER DELETE ON message_events BEGIN UPDATE fts_sync_state SET dirty = 1 WHERE singleton = 1; END",
+        ),
     ]);
     let mut stmt = conn.prepare(
         "SELECT name, sql FROM sqlite_schema
@@ -479,7 +564,7 @@ fn validate_fts_triggers(conn: &Connection) -> Result<()> {
                 .is_none_or(|actual| normalize_sql(actual) != normalize_sql(sql))
         })
     {
-        bail!("schema v2 dirty trigger set does not match");
+        bail!("schema v3 dirty trigger set does not match");
     }
     Ok(())
 }
@@ -649,6 +734,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         let tx = conn.transaction().unwrap();
         create_canonical_schema(&tx).unwrap();
+        tx.execute("DROP TABLE message_events", []).unwrap();
         tx.execute(
             "INSERT INTO index_metadata(singleton, sessions_root) VALUES (1, '/tmp/sessions')",
             [],
@@ -668,10 +754,10 @@ mod tests {
     #[test]
     fn future_schema_is_classified_without_inspection() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
         assert_eq!(
             detect_schema(&conn).unwrap(),
-            SchemaState::Future { version: 3 }
+            SchemaState::Future { version: 4 }
         );
     }
 
@@ -712,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_uses_contentless_delete_with_expected_columns() {
+    fn schema_v3_uses_contentless_delete_with_expected_columns() {
         let mut conn = Connection::open_in_memory().unwrap();
         let tx = conn.transaction().unwrap();
         create_schema(&tx).unwrap();
@@ -721,7 +807,7 @@ mod tests {
             [],
         )
         .unwrap();
-        tx.execute_batch("PRAGMA user_version = 2;").unwrap();
+        tx.execute_batch("PRAGMA user_version = 3;").unwrap();
         tx.commit().unwrap();
 
         assert_eq!(

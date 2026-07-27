@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 use crate::{
     cli::ReplayOptions,
+    session_event::{MessageRole, normalize_message_record},
     terminal,
     ui::{bottom_scroll_offset, half_page_height, pane_content_area},
     ui_state::ExecVisibility,
@@ -589,6 +590,19 @@ fn parse_json_values(input: &str) -> Result<Vec<serde_json::Value>> {
 }
 
 fn normalize_record(value: serde_json::Value) -> Result<Option<NormalizedEvent>> {
+    if let Some(message) = normalize_message_record(&value) {
+        let event = match message.role {
+            MessageRole::User => PayloadEvent::UserMessage {
+                message: message.content,
+                phase: message.phase,
+            },
+            MessageRole::Agent => PayloadEvent::AgentMessage {
+                message: message.content,
+                phase: message.phase,
+            },
+        };
+        return Ok(Some(NormalizedEvent::Payload(event)));
+    }
     if let Ok(event) = serde_json::from_value::<PayloadEvent>(value.clone()) {
         return Ok(Some(NormalizedEvent::Payload(event)));
     }

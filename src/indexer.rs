@@ -19,6 +19,7 @@ use schema::{SchemaState, detect_schema};
 
 pub(crate) type SessionKey = i64;
 pub(crate) type ExecKey = i64;
+pub(crate) type MessageKey = i64;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct IndexDelta {
@@ -28,6 +29,9 @@ pub(crate) struct IndexDelta {
     pub inserted_exec_keys: Vec<ExecKey>,
     pub updated_exec_keys: Vec<ExecKey>,
     pub deleted_exec_keys: Vec<ExecKey>,
+    pub inserted_message_keys: Vec<MessageKey>,
+    pub updated_message_keys: Vec<MessageKey>,
+    pub deleted_message_keys: Vec<MessageKey>,
     pub touched_session_keys: Vec<SessionKey>,
 }
 
@@ -50,6 +54,7 @@ pub(crate) struct IndexSummary {
     pub skipped_files: usize,
     pub session_rows: usize,
     pub exec_rows: usize,
+    pub message_rows: usize,
     pub output: PathBuf,
 }
 
@@ -69,11 +74,25 @@ pub(crate) fn build_index(options: &IndexOptions) -> Result<IndexOutcome> {
         IndexMode::Incremental => store::load_fingerprints(&conn)?,
         IndexMode::Rebuild => BTreeMap::<PathBuf, StoredSource>::new(),
     };
-    let plan = scan_sources(&root, &stored, mode == IndexMode::Rebuild)?;
+    let force_all = matches!(
+        state,
+        SchemaState::CanonicalV1 { .. } | SchemaState::FtsV2 { .. }
+    );
+    let plan = scan_sources(&root, &stored, mode == IndexMode::Rebuild || force_all)?;
+    if force_all && !plan.unstable_paths.is_empty() {
+        bail!(
+            "cannot migrate index schema to 3 while {} source files are changing; retry the index refresh",
+            plan.unstable_paths.len()
+        );
+    }
 
     let tx = store::begin_immediate(&mut conn)?;
     let fts_mode = match (&state, mode) {
-        (SchemaState::CanonicalV1 { .. }, IndexMode::Incremental) => {
+        (SchemaState::CanonicalV1 { .. } | SchemaState::FtsV2 { .. }, IndexMode::Incremental) => {
+            if matches!(state, SchemaState::FtsV2 { .. }) {
+                fts::drop_schema(&tx)?;
+            }
+            tx.execute_batch("CREATE TABLE message_events (event_index INTEGER NOT NULL CHECK (event_index >= 0), role TEXT NOT NULL CHECK (role IN ('user', 'agent')), content TEXT NOT NULL, message_key INTEGER PRIMARY KEY, session_key INTEGER NOT NULL REFERENCES sessions(session_key) ON DELETE CASCADE, UNIQUE (session_key, event_index)) STRICT;")?;
             fts::create_schema(&tx)?;
             fts::FtsSyncMode::Populate
         }
@@ -106,12 +125,16 @@ pub(crate) fn build_index(options: &IndexOptions) -> Result<IndexOutcome> {
 fn choose_mode(state: &SchemaState, root: &Path, rebuild: bool) -> Result<IndexMode> {
     match state {
         SchemaState::Empty | SchemaState::Legacy => Ok(IndexMode::Rebuild),
-        SchemaState::CanonicalV1 { sessions_root } | SchemaState::Current { sessions_root }
+        SchemaState::CanonicalV1 { sessions_root }
+        | SchemaState::FtsV2 { sessions_root }
+        | SchemaState::Current { sessions_root }
             if rebuild || sessions_root.to_string_lossy() != root.to_string_lossy() =>
         {
             Ok(IndexMode::Rebuild)
         }
-        SchemaState::CanonicalV1 { .. } | SchemaState::Current { .. } => Ok(IndexMode::Incremental),
+        SchemaState::CanonicalV1 { .. }
+        | SchemaState::FtsV2 { .. }
+        | SchemaState::Current { .. } => Ok(IndexMode::Incremental),
         SchemaState::Future { version } => bail!(
             "index schema version {version} is newer than supported version {}; refusing to overwrite it",
             schema::SCHEMA_VERSION
@@ -141,6 +164,7 @@ fn summary_from(
         skipped_files: counts.skipped_files,
         session_rows: counts.session_rows,
         exec_rows: counts.exec_rows,
+        message_rows: counts.message_rows,
         output,
     }
 }
@@ -151,7 +175,7 @@ pub(crate) fn format_summary(summary: &IndexSummary) -> String {
         IndexMode::Rebuild => "rebuilt",
     };
     format!(
-        "{action} canonical index at {}: scanned {} jsonl files; parsed {} ({} new, {} changed), kept {} unchanged, removed {} deleted, deferred {} unstable, skipped {}; stored {} sessions and {} exec events",
+        "{action} canonical index at {}: scanned {} jsonl files; parsed {} ({} new, {} changed), kept {} unchanged, removed {} deleted, deferred {} unstable, skipped {}; stored {} sessions, {} messages and {} exec events",
         summary.output.display(),
         summary.scanned_files,
         summary.parsed_files,
@@ -162,6 +186,7 @@ pub(crate) fn format_summary(summary: &IndexSummary) -> String {
         summary.unstable_files,
         summary.skipped_files,
         summary.session_rows,
+        summary.message_rows,
         summary.exec_rows,
     )
 }
@@ -235,7 +260,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
     }
 
@@ -624,7 +649,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
     }
 
@@ -639,6 +664,7 @@ mod tests {
         let mut conn = store::open_configured_connection(&db).unwrap();
         let tx = store::begin_immediate(&mut conn).unwrap();
         fts::drop_schema(&tx).unwrap();
+        tx.execute("DROP TABLE message_events", []).unwrap();
         tx.execute_batch("PRAGMA user_version = 1;").unwrap();
         tx.commit().unwrap();
         assert!(matches!(
@@ -649,7 +675,7 @@ mod tests {
 
         let outcome = build_index(&options).unwrap();
         assert_eq!(outcome.summary.mode, IndexMode::Incremental);
-        assert_eq!(outcome.summary.parsed_files, 0);
+        assert_eq!(outcome.summary.parsed_files, 1);
         let index = search::SearchIndex::open(&db, store::SessionView::default()).unwrap();
         assert_eq!(
             index
@@ -706,13 +732,14 @@ mod tests {
                 .search("external", search::SearchScope::FirstMessage)
                 .unwrap()
                 .len(),
-            1
+            0
         );
-        assert!(
+        assert_eq!(
             index
                 .search("original", search::SearchScope::FirstMessage)
                 .unwrap()
-                .is_empty()
+                .len(),
+            1
         );
     }
 
@@ -760,9 +787,8 @@ mod tests {
         let conn = Connection::open(&db).unwrap();
         conn.execute(
             "INSERT INTO sessions_fts(
-                 rowid, first_message, cwd, repository_url, branch,
-                 timestamp, date, exec_command, exec_output
-             ) VALUES (99999, 'extra', '', '', '', '', '', '', '')",
+                 rowid, user_content, agent_content, exec_command, exec_output
+             ) VALUES (99999, 'extra', '', '', '')",
             [],
         )
         .unwrap();
@@ -873,7 +899,7 @@ mod tests {
 
         let future_db = fixture.path("future.sqlite3");
         let conn = Connection::open(&future_db).unwrap();
-        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
         drop(conn);
         let mut future_options = options(&fixture, future_db);
         future_options.rebuild = true;
@@ -899,11 +925,12 @@ mod tests {
             skipped_files: 2,
             session_rows: 6,
             exec_rows: 9,
+            message_rows: 12,
             output: PathBuf::from("/tmp/index.sqlite3"),
         };
         assert_eq!(
             format_summary(&summary),
-            "updated canonical index at /tmp/index.sqlite3: scanned 8 jsonl files; parsed 3 (2 new, 1 changed), kept 4 unchanged, removed 1 deleted, deferred 1 unstable, skipped 2; stored 6 sessions and 9 exec events"
+            "updated canonical index at /tmp/index.sqlite3: scanned 8 jsonl files; parsed 3 (2 new, 1 changed), kept 4 unchanged, removed 1 deleted, deferred 1 unstable, skipped 2; stored 6 sessions, 12 messages and 9 exec events"
         );
     }
 

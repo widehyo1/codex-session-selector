@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{IndexDelta, SessionKey};
+use crate::session_event::MessageRole;
 
 pub(crate) const FTS_MIN_SQLITE: (u32, u32, u32) = (3, 43, 0);
 
@@ -16,12 +17,8 @@ CREATE TABLE fts_sync_state (
 INSERT INTO fts_sync_state(singleton, dirty) VALUES (1, 1);
 
 CREATE VIRTUAL TABLE sessions_fts USING fts5(
-    first_message,
-    cwd,
-    repository_url,
-    branch,
-    timestamp,
-    date,
+    user_content,
+    agent_content,
     exec_command,
     exec_output,
     content='',
@@ -69,32 +66,34 @@ AFTER DELETE ON exec_events
 BEGIN
     UPDATE fts_sync_state SET dirty = 1 WHERE singleton = 1;
 END;
+
+CREATE TRIGGER message_events_fts_dirty_ai AFTER INSERT ON message_events BEGIN UPDATE fts_sync_state SET dirty = 1 WHERE singleton = 1; END;
+CREATE TRIGGER message_events_fts_dirty_au AFTER UPDATE ON message_events BEGIN UPDATE fts_sync_state SET dirty = 1 WHERE singleton = 1; END;
+CREATE TRIGGER message_events_fts_dirty_ad AFTER DELETE ON message_events BEGIN UPDATE fts_sync_state SET dirty = 1 WHERE singleton = 1; END;
 "#;
 
 const INSERT_DOCUMENT: &str = "
     INSERT OR REPLACE INTO sessions_fts(
-        rowid, first_message, cwd, repository_url, branch,
-        timestamp, date, exec_command, exec_output
-    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+        rowid, user_content, agent_content, exec_command, exec_output
+    ) VALUES (?1, ?2, ?3, ?4, ?5)";
 
-const DIRTY_TRIGGERS: [&str; 6] = [
+const DIRTY_TRIGGERS: [&str; 9] = [
     "sessions_fts_dirty_ai",
     "sessions_fts_dirty_au",
     "sessions_fts_dirty_ad",
     "exec_events_fts_dirty_ai",
     "exec_events_fts_dirty_au",
     "exec_events_fts_dirty_ad",
+    "message_events_fts_dirty_ai",
+    "message_events_fts_dirty_au",
+    "message_events_fts_dirty_ad",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SearchDocument {
     pub session_key: SessionKey,
-    pub first_message: String,
-    pub cwd: String,
-    pub repository_url: String,
-    pub branch: String,
-    pub timestamp: String,
-    pub date: String,
+    pub user_content: String,
+    pub agent_content: String,
     pub exec_command: String,
     pub exec_output: String,
 }
@@ -166,26 +165,28 @@ pub(crate) fn load_document(
     tx: &Transaction<'_>,
     session_key: SessionKey,
 ) -> Result<Option<SearchDocument>> {
-    let session = tx
-        .query_row(
-            "SELECT first_message, cwd, repository_url, branch, timestamp
-             FROM sessions
-             WHERE session_key = ?1",
-            params![session_key],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                ))
-            },
-        )
-        .optional()?;
-    let Some((first_message, cwd, repository_url, branch, timestamp)) = session else {
+    let exists = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_key = ?1)",
+        params![session_key],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
         return Ok(None);
-    };
+    }
+    let mut users = Vec::new();
+    let mut agents = Vec::new();
+    let mut messages = tx.prepare(
+        "SELECT role, content FROM message_events WHERE session_key = ?1 ORDER BY event_index",
+    )?;
+    for row in messages.query_map(params![session_key], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (role, content) = row?;
+        match MessageRole::from_str(&role)? {
+            MessageRole::User => users.push(content),
+            MessageRole::Agent => agents.push(content),
+        }
+    }
 
     let mut stmt = tx.prepare(
         "SELECT command, output
@@ -202,12 +203,8 @@ pub(crate) fn load_document(
 
     Ok(Some(SearchDocument {
         session_key,
-        first_message,
-        cwd,
-        repository_url,
-        branch,
-        date: timestamp.chars().take(10).collect(),
-        timestamp,
+        user_content: users.join("\n"),
+        agent_content: agents.join("\n"),
         exec_command: commands.join("\n"),
         exec_output: outputs.join("\n"),
     }))
@@ -218,12 +215,8 @@ fn insert_document(tx: &Transaction<'_>, document: &SearchDocument) -> Result<()
         INSERT_DOCUMENT,
         params![
             document.session_key,
-            document.first_message,
-            document.cwd,
-            document.repository_url,
-            document.branch,
-            document.timestamp,
-            document.date,
+            document.user_content,
+            document.agent_content,
             document.exec_command,
             document.exec_output,
         ],

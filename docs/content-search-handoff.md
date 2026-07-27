@@ -1,5 +1,15 @@
 # 메타/콘텐츠 검색 분리 구현 Handoff
 
+## 구현 진행 기록
+
+- schema/package: v3 / 0.4.0으로 갱신했다.
+- canonical `message_events`와 역할별 content FTS 문서를 추가했다.
+- selector는 metadata 및 content:all/user/agent/exec target을 Tab으로 순환한다.
+- v1/v2 index는 refresh 시 source를 다시 읽어 v3으로 마이그레이션한다.
+- v2 전용 unit/CLI/benchmark fixture와 assertion을 v3 계약에 맞춰 갱신했다.
+- 검증: `cargo test --all-targets --all-features`, `cargo build --release`,
+  `bash scripts/benchmark-fts.sh`, `cargo clippy --all-targets --all-features -- -D warnings` 통과.
+
 ## 1. 문서 상태와 목적
 
 - 상태: 구현 대기 handoff

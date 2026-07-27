@@ -75,7 +75,7 @@ fn stdout(output: std::process::Output) -> String {
 fn expected_summary(action: &str, db: &Path, counts: [usize; 6]) -> String {
     let [scanned, parsed, new_files, changed, unchanged, deleted] = counts;
     format!(
-        "{action} canonical index at {}: scanned {scanned} jsonl files; parsed {parsed} ({new_files} new, {changed} changed), kept {unchanged} unchanged, removed {deleted} deleted, deferred 0 unstable, skipped 0; stored {scanned} sessions and 0 exec events\n",
+        "{action} canonical index at {}: scanned {scanned} jsonl files; parsed {parsed} ({new_files} new, {changed} changed), kept {unchanged} unchanged, removed {deleted} deleted, deferred 0 unstable, skipped 0; stored {scanned} sessions, {scanned} messages and 0 exec events\n",
         db.display()
     )
 }
@@ -109,7 +109,7 @@ fn index_help_lists_legacy_recorder_options() {
 }
 
 #[test]
-fn index_creates_schema_v2_with_fts() {
+fn index_creates_schema_v3_with_content_fts() {
     let fixture = Fixture::new();
     fixture.write_session("normal.jsonl", "증분 인덱스 확인");
     let output = stdout(fixture.index().output().unwrap());
@@ -122,7 +122,7 @@ fn index_creates_schema_v2_with_fts() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
     assert_eq!(
         conn.query_row("SELECT count(*) FROM sessions_fts", [], |row| row
@@ -152,8 +152,12 @@ fn selector_no_refresh_rejects_schema_v1_with_action() {
          DROP TRIGGER exec_events_fts_dirty_ai;
          DROP TRIGGER exec_events_fts_dirty_au;
          DROP TRIGGER exec_events_fts_dirty_ad;
+         DROP TRIGGER message_events_fts_dirty_ai;
+         DROP TRIGGER message_events_fts_dirty_au;
+         DROP TRIGGER message_events_fts_dirty_ad;
          DROP TABLE sessions_fts;
          DROP TABLE fts_sync_state;
+         DROP TABLE message_events;
          PRAGMA user_version = 1;",
     )
     .unwrap();
@@ -170,7 +174,7 @@ fn selector_no_refresh_rejects_schema_v1_with_action() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains(
-        "search index schema 2 is required; refresh the index or run `select-codex-session index`"
+        "search index schema 3 is required; refresh the index or run `select-codex-session index`"
     ));
 }
 

@@ -8,10 +8,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use crate::{ExecEvent, SessionRow};
+use crate::{ExecEvent, MessageEvent, SessionRow};
 
 use super::{
-    ExecKey, IndexDelta, SessionKey,
+    ExecKey, IndexDelta, MessageKey, SessionKey,
     scan::{FileFingerprint, ParseStatus, ParsedSource, ScanPlan, StoredSource},
     schema,
 };
@@ -27,6 +27,7 @@ pub(crate) struct StoredCounts {
     pub skipped_files: usize,
     pub session_rows: usize,
     pub exec_rows: usize,
+    pub message_rows: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +198,7 @@ fn apply_source(tx: &Transaction<'_>, source: &ParsedSource, delta: &mut IndexDe
         }
     };
     apply_exec_diff(tx, session_key, &parsed.exec_events, delta)?;
+    apply_message_diff(tx, session_key, &parsed.message_events, delta)?;
     Ok(())
 }
 
@@ -361,6 +363,58 @@ fn apply_exec_diff(
     Ok(())
 }
 
+fn apply_message_diff(
+    tx: &Transaction<'_>,
+    session_key: SessionKey,
+    parsed: &[MessageEvent],
+    delta: &mut IndexDelta,
+) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "SELECT message_key, event_index, role, content FROM message_events WHERE session_key = ?1",
+    )?;
+    let mut existing = BTreeMap::new();
+    for row in stmt.query_map(params![session_key], |row| {
+        Ok((
+            usize::try_from(row.get::<_, i64>(1)?).unwrap(),
+            row.get::<_, MessageKey>(0)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })? {
+        let (index, key, role, content) = row?;
+        existing.insert(index, (key, role, content));
+    }
+    for event in parsed {
+        match existing.remove(&event.event_index) {
+            None => {
+                let key = tx.query_row("INSERT INTO message_events(event_index, role, content, session_key) VALUES (?1, ?2, ?3, ?4) RETURNING message_key", params![i64::try_from(event.event_index)?, event.role.as_str(), event.content, session_key], |row| row.get(0))?;
+                delta.inserted_message_keys.push(key);
+                delta.touched_session_keys.push(session_key);
+            }
+            Some((key, role, content))
+                if role != event.role.as_str() || content != event.content =>
+            {
+                tx.execute(
+                    "UPDATE message_events SET role=?1, content=?2 WHERE message_key=?3",
+                    params![event.role.as_str(), event.content, key],
+                )?;
+                delta.updated_message_keys.push(key);
+                delta.touched_session_keys.push(session_key);
+            }
+            _ => {}
+        }
+    }
+    for (_, (key, _, _)) in existing {
+        tx.execute(
+            "DELETE FROM message_events WHERE message_key = ?1",
+            params![key],
+        )?;
+        delta.deleted_message_keys.push(key);
+        delta.touched_session_keys.push(session_key);
+    }
+    Ok(())
+}
+
 fn insert_exec(tx: &Transaction<'_>, session_key: i64, event: &ExecEvent) -> Result<i64> {
     Ok(tx.query_row(
         "INSERT INTO exec_events(
@@ -441,6 +495,14 @@ fn record_session_deletion(
         .query_map(params![session_key], |row| row.get::<_, i64>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     delta.deleted_exec_keys.extend(keys);
+    let mut messages = tx.prepare(
+        "SELECT message_key FROM message_events WHERE session_key = ?1 ORDER BY message_key",
+    )?;
+    delta.deleted_message_keys.extend(
+        messages
+            .query_map(params![session_key], |row| row.get::<_, MessageKey>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    );
     delta.deleted_session_keys.push(session_key);
     delta.touched_session_keys.push(session_key);
     Ok(())
@@ -502,6 +564,7 @@ pub(crate) fn query_counts(tx: &Transaction<'_>) -> Result<StoredCounts> {
         )?,
         session_rows: count(tx, "SELECT count(*) FROM sessions")?,
         exec_rows: count(tx, "SELECT count(*) FROM exec_events")?,
+        message_rows: count(tx, "SELECT count(*) FROM message_events")?,
     })
 }
 

@@ -209,7 +209,17 @@ fn write_session(path: &Path, index: usize, changed: bool) {
             }
         }),
     ];
-    for event in 0..5 {
+    for event in 0..6 {
+        records.push(json!({
+            "type": "event_msg",
+            "payload": { "type": "user_message", "message": format!("user benchmark item{index} event{event} 검색기능{marker}") }
+        }));
+        records.push(json!({
+            "type": "event_msg",
+            "payload": { "type": "agent_message", "message": format!("agent benchmark item{index} event{event} response{marker}") }
+        }));
+    }
+    for event in 0..2 {
         records.push(json!({
             "type": "event_msg",
             "payload": {
@@ -299,16 +309,12 @@ fn build_canonical_only(path: &Path, size: usize) {
     tx.commit().unwrap();
 }
 
-fn benchmark_queries() -> [&'static str; 8] {
+fn benchmark_queries() -> [&'static str; 4] {
     [
-        "(\"item424\"*)",
-        "{first_message} : ((\"검색\"* AND \"item4242\"*))",
-        "{cwd} : ((\"project-4242\"*))",
-        "{repository_url} : ((\"repo-42\"*))",
-        "{branch} : ((\"batch-7\"*))",
-        "{date} : ((\"2026\"* AND \"07\"* AND \"27\"*))",
+        "(\"item4242\"*)",
+        "{user_content} : ((\"item4242\"*))",
+        "{agent_content} : ((\"response\"* AND \"item4242\"*))",
         "{exec_command exec_output} : ((\"target4242\"*))",
-        "(\"needle4242\"*)",
     ]
 }
 
@@ -320,7 +326,7 @@ fn run_query(conn: &Connection, query: &str) -> Vec<i64> {
              JOIN sessions AS s ON s.session_key = sessions_fts.rowid
              WHERE sessions_fts MATCH ?1
                AND sessions_fts.rank MATCH
-                   'bm25(10.0, 4.0, 4.0, 5.0, 2.0, 2.0, 1.5, 0.25)'
+                   'bm25(4.0, 4.0, 1.5, 0.25)'
              ORDER BY sessions_fts.rank, s.timestamp DESC, s.session_key DESC",
         )
         .unwrap();

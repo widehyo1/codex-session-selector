@@ -16,9 +16,17 @@ use super::{
     store::SessionView,
 };
 
-#[cfg(test)]
-const BM25_WEIGHTS: &str = "bm25(10.0, 4.0, 4.0, 5.0, 2.0, 2.0, 1.5, 0.25)";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContentScope {
+    All,
+    User,
+    Agent,
+    Exec,
+}
 
+// Compatibility for internal callers that have not yet been migrated. The
+// selector itself intentionally exposes only ContentScope.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SearchScope {
     All,
@@ -29,6 +37,18 @@ pub(crate) enum SearchScope {
     Date,
     Exec,
 }
+impl From<SearchScope> for ContentScope {
+    fn from(value: SearchScope) -> Self {
+        match value {
+            SearchScope::Exec => Self::Exec,
+            SearchScope::All => Self::All,
+            _ => Self::User,
+        }
+    }
+}
+
+#[cfg(test)]
+const BM25_WEIGHTS: &str = "bm25(4.0, 4.0, 1.5, 0.25)";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SearchHit {
@@ -153,9 +173,9 @@ fn ensure_searchable(text: &str) -> std::result::Result<(), QueryError> {
     }
 }
 
-pub(crate) fn compile_match(
+pub(crate) fn compile_match<T: Into<ContentScope>>(
     query: &SearchQuery,
-    scope: SearchScope,
+    scope: T,
 ) -> std::result::Result<String, QueryError> {
     if query.groups.is_empty() || query.groups.iter().any(|group| group.atoms.is_empty()) {
         return Err(QueryError::NoSearchableToken);
@@ -178,14 +198,11 @@ pub(crate) fn compile_match(
         .collect::<Vec<_>>()
         .join(" OR ");
 
-    let columns = match scope {
-        SearchScope::All => return Ok(compiled),
-        SearchScope::FirstMessage => "first_message",
-        SearchScope::Cwd => "cwd",
-        SearchScope::Branch => "branch",
-        SearchScope::Repository => "repository_url",
-        SearchScope::Date => "date",
-        SearchScope::Exec => "exec_command exec_output",
+    let columns = match scope.into() {
+        ContentScope::All => return Ok(compiled),
+        ContentScope::User => "user_content",
+        ContentScope::Agent => "agent_content",
+        ContentScope::Exec => "exec_command exec_output",
     };
     Ok(format!("{{{columns}}} : ({compiled})"))
 }
@@ -205,8 +222,9 @@ impl SearchIndex {
             SchemaState::Empty
             | SchemaState::Legacy
             | SchemaState::CanonicalV1 { .. }
-            | SchemaState::Unknown { version: 0 | 1, .. } => bail!(
-                "search index schema 2 is required; refresh the index or run `select-codex-session index`"
+            | SchemaState::FtsV2 { .. }
+            | SchemaState::Unknown { version: 0..=2, .. } => bail!(
+                "search index schema 3 is required; refresh the index or run `select-codex-session index`"
             ),
             SchemaState::Future { version } => bail!(
                 "index schema version {version} is newer than supported version {}; refusing to open it",
@@ -221,7 +239,19 @@ impl SearchIndex {
         Ok(Self { conn, view })
     }
 
-    pub(crate) fn search(&self, input: &str, scope: SearchScope) -> Result<Vec<SearchHit>> {
+    pub(crate) fn all_sessions(&self) -> Result<Vec<SessionRow>> {
+        Ok(self
+            .query_unranked()?
+            .into_iter()
+            .map(|hit| hit.row)
+            .collect())
+    }
+
+    pub(crate) fn search_content(
+        &self,
+        input: &str,
+        scope: ContentScope,
+    ) -> Result<Vec<SearchHit>> {
         if input.trim().is_empty() {
             return self.query_unranked();
         }
@@ -236,7 +266,7 @@ impl SearchIndex {
              JOIN sessions AS s ON s.session_key = sessions_fts.rowid
              WHERE sessions_fts MATCH ?1
                AND sessions_fts.rank MATCH
-                   'bm25(10.0, 4.0, 4.0, 5.0, 2.0, 2.0, 1.5, 0.25)'
+                   'bm25(4.0, 4.0, 1.5, 0.25)'
                AND (?2 = 1 OR s.is_subsession = 0)
                AND (?3 = 1 OR s.has_nonempty_first_message = 1)
              ORDER BY sessions_fts.rank ASC, s.timestamp DESC, s.session_key DESC",
@@ -250,6 +280,11 @@ impl SearchIndex {
             map_ranked_hit,
         )?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn search(&self, input: &str, scope: SearchScope) -> Result<Vec<SearchHit>> {
+        self.search_content(input, scope.into())
     }
 
     fn query_unranked(&self) -> Result<Vec<SearchHit>> {
@@ -411,14 +446,11 @@ mod tests {
     fn scopes_wrap_only_the_expected_columns() {
         let query = parse_query("read").unwrap();
         let cases = [
-            (SearchScope::All, "(\"read\"*)"),
-            (SearchScope::FirstMessage, "{first_message} : ((\"read\"*))"),
-            (SearchScope::Cwd, "{cwd} : ((\"read\"*))"),
-            (SearchScope::Branch, "{branch} : ((\"read\"*))"),
-            (SearchScope::Repository, "{repository_url} : ((\"read\"*))"),
-            (SearchScope::Date, "{date} : ((\"read\"*))"),
+            (ContentScope::All, "(\"read\"*)"),
+            (ContentScope::User, "{user_content} : ((\"read\"*))"),
+            (ContentScope::Agent, "{agent_content} : ((\"read\"*))"),
             (
-                SearchScope::Exec,
+                ContentScope::Exec,
                 "{exec_command exec_output} : ((\"read\"*))",
             ),
         ];
@@ -447,10 +479,7 @@ mod tests {
 
     #[test]
     fn bm25_weight_mapping_stays_fixed() {
-        assert_eq!(
-            BM25_WEIGHTS,
-            "bm25(10.0, 4.0, 4.0, 5.0, 2.0, 2.0, 1.5, 0.25)"
-        );
+        assert_eq!(BM25_WEIGHTS, "bm25(4.0, 4.0, 1.5, 0.25)");
     }
 
     #[test]
@@ -466,24 +495,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(index.search("repo dem", SearchScope::Cwd).unwrap().len(), 2);
-        assert_eq!(
-            index
-                .search("git exam", SearchScope::Repository)
-                .unwrap()
-                .len(),
-            2
-        );
         assert_eq!(
             index.search("sed read", SearchScope::Exec).unwrap().len(),
             1
         );
         assert_eq!(
             index.search("real read", SearchScope::All).unwrap().len(),
-            1
-        );
-        assert_eq!(
-            index.search("2026 05 28", SearchScope::Date).unwrap().len(),
             1
         );
     }
@@ -538,10 +555,17 @@ mod tests {
         };
         build_index(&options).unwrap();
         let conn = Connection::open(&db).unwrap();
+        let first_key = conn
+            .query_row(
+                "SELECT session_key FROM sessions WHERE path = ?1",
+                params![first.to_string_lossy().as_ref()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
         conn.execute(
-            "UPDATE sessions SET first_message = 'weightedterm'
-             WHERE path = ?1",
-            params![first.to_string_lossy().as_ref()],
+            "INSERT INTO message_events(event_index, role, content, session_key)
+             VALUES (999, 'user', 'weightedterm', ?1)",
+            params![first_key],
         )
         .unwrap();
         let second_key = conn

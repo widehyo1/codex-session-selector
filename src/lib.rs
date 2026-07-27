@@ -14,6 +14,7 @@ mod cli;
 mod indexer;
 mod replay;
 mod selector;
+mod session_event;
 mod terminal;
 mod ui;
 mod ui_state;
@@ -81,6 +82,14 @@ pub struct CollectedSessionData {
 pub(crate) struct ParsedSessionFile {
     pub(crate) row: SessionRow,
     pub(crate) exec_events: Vec<ExecEvent>,
+    pub(crate) message_events: Vec<MessageEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MessageEvent {
+    pub event_index: usize,
+    pub role: session_event::MessageRole,
+    pub content: String,
 }
 
 pub fn is_subsession_meta(payload: &Value) -> bool {
@@ -116,6 +125,7 @@ pub(crate) fn parse_session_file_data(
     let mut meta: Option<SessionRow> = None;
     let mut first_message: Option<String> = None;
     let mut exec_events: Vec<ExecEvent> = Vec::new();
+    let mut message_events = Vec::new();
     let mut exec_by_call_id: HashMap<String, usize> = HashMap::new();
 
     for (line_number, line) in reader.lines().enumerate() {
@@ -177,6 +187,13 @@ pub(crate) fn parse_session_file_data(
                 &mut exec_events,
                 &mut exec_by_call_id,
             );
+            if let Some(message) = session_event::normalize_message_record(&value) {
+                message_events.push(MessageEvent {
+                    event_index: line_number,
+                    role: message.role,
+                    content: message.content,
+                });
+            }
         }
 
         if !include_exec && meta.is_some() && first_message.is_some() {
@@ -191,7 +208,11 @@ pub(crate) fn parse_session_file_data(
     for event in &mut exec_events {
         event.session_id = row.id.clone();
     }
-    Ok(Some(ParsedSessionFile { row, exec_events }))
+    Ok(Some(ParsedSessionFile {
+        row,
+        exec_events,
+        message_events,
+    }))
 }
 
 pub fn should_include_row(row: &SessionRow, options: CollectOptions) -> bool {

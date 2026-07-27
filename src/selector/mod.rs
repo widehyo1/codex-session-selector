@@ -11,8 +11,8 @@ use ratatui::{
 };
 
 use crate::{
-    SessionRow,
-    indexer::search::{QueryError, SearchIndex, SearchScope, is_corruption},
+    SessionRow, filter_sessions,
+    indexer::search::{ContentScope, QueryError, SearchIndex, is_corruption},
     session_date, terminal,
     ui::{bottom_scroll_offset, half_page_height, pane_content_area},
     ui_state::ExecVisibility,
@@ -30,6 +30,32 @@ enum PaneFocus {
     Message,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchTarget {
+    Metadata,
+    Content(ContentScope),
+}
+impl SearchTarget {
+    fn next(self) -> Self {
+        match self {
+            Self::Metadata => Self::Content(ContentScope::All),
+            Self::Content(ContentScope::All) => Self::Content(ContentScope::User),
+            Self::Content(ContentScope::User) => Self::Content(ContentScope::Agent),
+            Self::Content(ContentScope::Agent) => Self::Content(ContentScope::Exec),
+            Self::Content(ContentScope::Exec) => Self::Metadata,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::Content(ContentScope::All) => "content:all",
+            Self::Content(ContentScope::User) => "content:user",
+            Self::Content(ContentScope::Agent) => "content:agent",
+            Self::Content(ContentScope::Exec) => "content:exec",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SelectorAction {
     Quit,
@@ -38,11 +64,12 @@ pub(crate) enum SelectorAction {
 
 pub(crate) struct SelectorApp {
     search_index: SearchIndex,
+    all_rows: Vec<SessionRow>,
     total_rows: usize,
     filtered: Vec<SessionRow>,
     list_state: ListState,
     query: String,
-    search_scope: SearchScope,
+    search_target: SearchTarget,
     mode: Mode,
     focus: PaneFocus,
     metadata_scroll: usize,
@@ -57,11 +84,7 @@ pub(crate) struct SelectorApp {
 
 impl SelectorApp {
     pub(crate) fn new(search_index: SearchIndex, exec_visibility: ExecVisibility) -> Result<Self> {
-        let filtered = search_index
-            .search("", SearchScope::All)?
-            .into_iter()
-            .map(|hit| hit.row)
-            .collect::<Vec<_>>();
+        let filtered = search_index.all_sessions()?;
         let total_rows = filtered.len();
         let mut list_state = ListState::default();
         if !filtered.is_empty() {
@@ -70,11 +93,12 @@ impl SelectorApp {
 
         Ok(Self {
             search_index,
+            all_rows: filtered.clone(),
             total_rows,
             filtered,
             list_state,
             query: String::new(),
-            search_scope: SearchScope::All,
+            search_target: SearchTarget::Metadata,
             mode: Mode::Normal,
             focus: PaneFocus::Sessions,
             metadata_scroll: 0,
@@ -106,9 +130,16 @@ impl SelectorApp {
     }
 
     fn refresh_filter(&mut self) {
-        match self.search_index.search(&self.query, self.search_scope) {
-            Ok(hits) => {
-                self.filtered = hits.into_iter().map(|hit| hit.row).collect();
+        let result = match self.search_target {
+            SearchTarget::Metadata => Ok(filter_sessions(&self.all_rows, &self.query)),
+            SearchTarget::Content(scope) => self
+                .search_index
+                .search_content(&self.query, scope)
+                .map(|hits| hits.into_iter().map(|hit| hit.row).collect()),
+        };
+        match result {
+            Ok(rows) => {
+                self.filtered = rows;
                 self.list_state
                     .select((!self.filtered.is_empty()).then_some(0));
                 self.message_scroll = 0;
@@ -127,8 +158,8 @@ impl SelectorApp {
         };
     }
 
-    fn next_search_scope(&mut self) {
-        self.search_scope = self.search_scope.next();
+    fn next_search_target(&mut self) {
+        self.search_target = self.search_target.next();
         self.refresh_filter();
     }
 
@@ -362,7 +393,7 @@ impl SelectorApp {
             Mode::Search => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Normal,
-                    KeyCode::Tab => self.next_search_scope(),
+                    KeyCode::Tab => self.next_search_target(),
                     KeyCode::Backspace => {
                         self.query.pop();
                         self.refresh_filter();
@@ -590,10 +621,10 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
         ]),
         Mode::Search => Line::from(vec![
             Span::raw(" search: "),
-            Span::styled(app.search_scope.label(), Style::default().fg(Color::Cyan)),
+            Span::styled(app.search_target.label(), Style::default().fg(Color::Cyan)),
             Span::raw(" /"),
             Span::styled(app.query.clone(), Style::default().fg(Color::Yellow)),
-            Span::raw("  Tab scope  Enter accept  Esc cancel  Ctrl-C quit  Backspace delete "),
+            Span::raw("  Tab target  Enter accept  Esc cancel  Ctrl-C quit  Backspace delete "),
             Span::styled(status, Style::default().fg(Color::Yellow)),
         ]),
     }
@@ -629,7 +660,7 @@ fn render_help(frame: &mut Frame) {
         Line::raw(""),
         Line::raw("Search"),
         Line::raw("  /               interactive search"),
-        Line::raw("  Tab             cycle all/message/cwd/branch/repo/date/exec"),
+        Line::raw("  Tab             cycle metadata/content:all/user/agent/exec"),
         Line::raw("  Enter           accept search"),
         Line::raw("  Esc             leave search/help or quit"),
         Line::raw(""),
@@ -723,32 +754,6 @@ impl PaneFocus {
         match self {
             Self::Sessions => "sessions",
             Self::Message => "message",
-        }
-    }
-}
-
-impl SearchScope {
-    fn next(self) -> Self {
-        match self {
-            Self::All => Self::FirstMessage,
-            Self::FirstMessage => Self::Cwd,
-            Self::Cwd => Self::Branch,
-            Self::Branch => Self::Repository,
-            Self::Repository => Self::Date,
-            Self::Date => Self::Exec,
-            Self::Exec => Self::All,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::FirstMessage => "message",
-            Self::Cwd => "cwd",
-            Self::Branch => "branch",
-            Self::Repository => "repo",
-            Self::Date => "date",
-            Self::Exec => "exec",
         }
     }
 }
@@ -859,16 +864,14 @@ mod tests {
     }
 
     #[test]
-    fn search_scope_cycles_through_exec() {
+    fn search_target_cycles_through_content_scopes() {
         let scopes = [
-            SearchScope::All,
-            SearchScope::FirstMessage,
-            SearchScope::Cwd,
-            SearchScope::Branch,
-            SearchScope::Repository,
-            SearchScope::Date,
-            SearchScope::Exec,
-            SearchScope::All,
+            SearchTarget::Metadata,
+            SearchTarget::Content(ContentScope::All),
+            SearchTarget::Content(ContentScope::User),
+            SearchTarget::Content(ContentScope::Agent),
+            SearchTarget::Content(ContentScope::Exec),
+            SearchTarget::Metadata,
         ];
 
         for pair in scopes.windows(2) {
@@ -877,12 +880,12 @@ mod tests {
     }
 
     #[test]
-    fn exec_scope_label_is_exec() {
-        assert_eq!(SearchScope::All.next(), SearchScope::FirstMessage);
-        assert_eq!(SearchScope::Repository.next(), SearchScope::Date);
-        assert_eq!(SearchScope::Date.next(), SearchScope::Exec);
-        assert_eq!(SearchScope::Exec.label(), "exec");
-        assert_eq!(SearchScope::Exec.next(), SearchScope::All);
+    fn search_target_labels_are_visible() {
+        assert_eq!(SearchTarget::Metadata.label(), "metadata");
+        assert_eq!(
+            SearchTarget::Content(ContentScope::Exec).label(),
+            "content:exec"
+        );
     }
 
     #[test]
@@ -1001,7 +1004,7 @@ mod tests {
         let (_fixture, mut app) = sample_app(ExecVisibility::Hidden);
         app.list_state.select(Some(1));
         app.query = "selector".to_string();
-        app.search_scope = SearchScope::Branch;
+        app.search_target = SearchTarget::Content(ContentScope::Agent);
         app.focus = PaneFocus::Message;
         app.metadata_scroll = 8;
         app.message_scroll = 5;
@@ -1016,7 +1019,10 @@ mod tests {
         assert_eq!(app.filtered, filtered);
         assert_eq!(app.selected_index(), Some(1));
         assert_eq!(app.query, "selector");
-        assert_eq!(app.search_scope, SearchScope::Branch);
+        assert_eq!(
+            app.search_target,
+            SearchTarget::Content(ContentScope::Agent)
+        );
         assert_eq!(app.focus, PaneFocus::Message);
         assert_eq!(app.metadata_scroll, 8);
         assert_eq!(app.message_scroll, 5);
@@ -1040,6 +1046,7 @@ mod tests {
     #[test]
     fn query_error_preserves_previous_results_and_selection() {
         let (_fixture, mut app) = sample_app(ExecVisibility::Hidden);
+        app.search_target = SearchTarget::Content(ContentScope::All);
         app.query = "fix".to_owned();
         app.refresh_filter();
         let filtered = app.filtered.clone();
@@ -1061,6 +1068,7 @@ mod tests {
     #[test]
     fn database_error_preserves_previous_results_and_selection() {
         let (fixture, mut app) = sample_app(ExecVisibility::Hidden);
+        app.search_target = SearchTarget::Content(ContentScope::All);
         let filtered = app.filtered.clone();
         let selected = app.selected_index();
         app.message_scroll = 4;

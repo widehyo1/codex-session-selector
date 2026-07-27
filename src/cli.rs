@@ -247,7 +247,7 @@ Selector options:
 Keys:
   Enter                          replay selected session, then return here
   /                              interactive search
-  Tab                            switch pane focus; while searching, cycle scope
+  Tab                            switch pane focus; while searching, cycle metadata/content scope
   j/k or Up/Down                 move selection or scroll the focused message by one line
   d/u or Page keys               move selection or scroll the focused pane by half its height
   g/G or Home/End                first/last selection or message top/bottom (last line visible)
